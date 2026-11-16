@@ -1,0 +1,5 @@
+# Held with apt-mark during the update, then put back to their previous hold state.
+hold = ["mariadb-*", "mysql-*", "galera-*", "docker-ce*", "docker.io", "containerd*", "postgresql*"]
+
+# Failed units that verify does not count.
+ignore_failed_units = []

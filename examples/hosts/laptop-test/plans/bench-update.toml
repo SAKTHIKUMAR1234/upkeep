@@ -1,0 +1,10 @@
+confirm = true
+steps = [
+  "hr-dev:check_updates",
+  "hr-dev:maintenance_on",
+  "hr-dev:backup",
+  "hr-dev:update",
+  "hr-dev:verify",
+  "hr-dev:maintenance_off",
+]
+on_failure = ["hr-dev:maintenance_off"]

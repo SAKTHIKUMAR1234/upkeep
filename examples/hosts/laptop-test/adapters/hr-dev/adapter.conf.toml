@@ -1,0 +1,12 @@
+pilot = "/home/sakthi/development/pilot/bin/pilot"
+user = "sakthi"
+bench = "hr_dev"
+bench_dir = "/home/sakthi/development/pilot/benches/hr_dev"
+sites = ["hr-dev.localhost"]
+job_wait_timeout = "10m"
+# A development bench has no production workload to restart.
+restart = false
+
+[backup]
+with_files = true
+compress = false

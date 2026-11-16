@@ -1,0 +1,41 @@
+name = "hr-dev"
+run = "python3 /usr/local/lib/upkeep/adapters/frappe-bench/frappe_bench.py"
+writes_data = true
+
+[actions.maintenance_on]
+timeout = "15m"
+[actions.maintenance_off]
+timeout = "5m"
+[actions.backup]
+timeout = "60m"
+[actions.check_updates]
+timeout = "15m"
+[actions.update]
+timeout = "120m"
+needs = ["maintenance_on", "backup"]
+[actions.verify]
+timeout = "5m"
+
+[[service]]
+name = "web"
+kind = "process"
+pattern = "benches/hr_dev/env/bin/python .*frappe serve"
+
+[[service]]
+name = "worker"
+kind = "process"
+pattern = "benches/hr_dev/env/bin/python .*frappe worker"
+
+[[service]]
+name = "scheduler"
+kind = "process"
+pattern = "benches/hr_dev/env/bin/python .*frappe schedule"
+
+[[service]]
+name = "redis-queue"
+kind = "process"
+pattern = "redis-server 127.0.0.1:11002"
+
+[[ping]]
+name = "site answers"
+http = "http://hr-dev.localhost:8002/api/method/ping"
