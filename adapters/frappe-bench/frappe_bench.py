@@ -263,6 +263,8 @@ def update(context: Context) -> None:
 
     for site in bench.sites:
         bench.frappe(site, "migrate")
+    state["built"] = True
+    write_site_state(state_file, state)
     bench.pilot("build")
     restart = context.config.get("restart", True)
     if restart:
@@ -271,7 +273,7 @@ def update(context: Context) -> None:
 
 
 def rollback(context: Context) -> None:
-    """Puts the apps back on their commits from before update and restores the backup update started from."""
+    """Puts the apps back on their commits from before update, restores the backup and rebuilds assets update built."""
     bench = Bench(context.config)
     state_file = context.state_dir / UPDATE_STATE_FILE
     state = read_site_state(state_file)
@@ -283,6 +285,8 @@ def rollback(context: Context) -> None:
         bench.git(app, "reset", "--hard", commit)
     for site, database in state["databases"].items():
         restore_database(bench, context.config.get("restore", {}), site, database)
+    if state.get("built"):
+        bench.pilot("build")
     if context.config.get("restart", True):
         bench.pilot("restart")
     state_file.unlink()

@@ -233,6 +233,16 @@ class UpdateTest(unittest.TestCase):
         restore = shell.frappe_calls()[0]
         self.assertEqual(restore[:4], ("a.local", "restore", "a/private/backups/db.sql.gz", "--force"))
         self.assertFalse((self.state_dir / frappe_bench.UPDATE_STATE_FILE).exists())
+        self.assertFalse(any(command[-1] == "build" for command in shell.commands))
+
+    def test_rollback_rebuilds_assets_that_update_built(self):
+        password_file = self.state_dir / "root-password"
+        password_file.write_text("s3cret")
+        self.write_state({"databases": {"a.local": "db.sql.gz"}, "apps": {}, "built": True})
+        shell = FakeShell({})
+        context = self.context(restore={"db_root_password_file": str(password_file)}, restart=False)
+        self.run_action(frappe_bench.rollback, shell, context)
+        self.assertEqual(shell.commands[-1][-1], "build")
 
     def test_failed_restore_hides_the_root_password(self):
         password_file = self.state_dir / "root-password"

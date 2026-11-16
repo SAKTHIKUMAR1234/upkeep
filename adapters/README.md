@@ -39,7 +39,7 @@ Stop the databases before `snapshot` (for example with `writers:maintenance_on`)
 
 Actions: `maintenance_on`, `maintenance_off`, `backup`, `check_updates`, `update`, `rollback`, `verify`. Give `update` `needs = ["maintenance_on", "backup"]` in `adapter.toml`.
 
-`backup` starts an update: it saves each site's database file in `<state_dir>/update_state.json`. `update` refuses to run without it and saves each app's commit before it pulls. `rollback` resets the apps to those commits, restores the databases with `frappe restore` and restarts the bench. It does nothing when `update` did not start. Put it first in the plan's `on_failure`.
+`backup` starts an update: it saves each site's database file in `<state_dir>/update_state.json`. `update` refuses to run without it and saves each app's commit before it pulls. `rollback` resets the apps to those commits, restores the databases with `frappe restore`, rebuilds the assets when `update` got to its build and restarts the bench. It does nothing when `update` did not start. Put it first in the plan's `on_failure`.
 
 | Field | Default | Meaning |
 |---|---|---|
