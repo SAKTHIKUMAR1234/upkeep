@@ -49,6 +49,10 @@ impl Token {
         Ok(Self(token.into()))
     }
 
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     fn matches(&self, presented: &str) -> bool {
         let expected = self.0.as_bytes();
         let presented = presented.as_bytes();

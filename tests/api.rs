@@ -124,3 +124,67 @@ async fn second_daemon_on_the_same_state_is_refused() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("another upkeep serve is running"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_drives_a_registered_host_over_tcp() {
+    let mut harness = Harness::new();
+    let port = free_port();
+    harness.write_settings(&format!("listen = \"127.0.0.1:{port}\"\n"));
+    write_token(&harness, 0o600);
+    harness.start().await;
+
+    let client_dir = tempfile::tempdir().unwrap();
+    let upkeep = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_upkeep"))
+            .arg("--client-dir")
+            .arg(client_dir.path())
+            .env("USER", "tester")
+            .env_remove("SUDO_USER")
+            .args(args)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        (output.status.success(), text)
+    };
+    let token_file = harness.config_dir().join("token");
+    let url = format!("http://127.0.0.1:{port}");
+
+    let (added, text) = upkeep(&[
+        "host",
+        "add",
+        "vm-a",
+        "--url",
+        &url,
+        "--token-file",
+        token_file.to_str().unwrap(),
+    ]);
+    assert!(added, "{text}");
+    assert!(upkeep(&["host", "list"]).1.contains(&url));
+
+    let (started, text) = upkeep(&[
+        "--host",
+        "vm-a",
+        "run",
+        "demo-app:verify",
+        "--param",
+        "note=hi",
+    ]);
+    assert!(started, "{text}");
+    let detail = harness.wait_for_status(1, "succeeded").await;
+    assert_eq!(detail["job"]["requested_by"], "tester");
+    assert_eq!(detail["job"]["params"]["note"], "hi");
+    assert!(
+        upkeep(&["--host", "vm-a", "jobs"])
+            .1
+            .contains("demo-app:verify")
+    );
+
+    let (_, text) = upkeep(&["--host", "nas", "jobs"]);
+    assert!(
+        text.contains("no host named \"nas\"; known: vm-a"),
+        "{text}"
+    );
+    assert!(upkeep(&["host", "remove", "vm-a"]).0);
+    assert!(!upkeep(&["--host", "vm-a", "jobs"]).0);
+}

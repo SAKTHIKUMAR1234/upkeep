@@ -16,7 +16,7 @@ async fn main() -> std::process::ExitCode {
     let result = match &cli.command {
         Command::Serve => upkeep::api::serve(paths).await,
         Command::StepExec { dir } => upkeep::engine::step_exec::execute(dir).await,
-        command => run_client(command, &paths).await,
+        _ => run_client(&cli).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
