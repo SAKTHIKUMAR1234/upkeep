@@ -1,0 +1,17 @@
+name = "demo-app"
+run = "sh adapter.sh"
+writes_data = true
+
+[actions.maintenance_on]
+timeout = "1m"
+[actions.maintenance_off]
+timeout = "1m"
+[actions.backup]
+timeout = "10m"
+needs = ["maintenance_on"]
+[actions.verify]
+timeout = "1m"
+
+[[ping]]
+name = "demo-app answers"
+command = "test ! -e \"$UPKEEP_STATE_DIR/broken\""

@@ -1,0 +1,7 @@
+# TCP API with bearer token from /etc/upkeep/token (chmod 600). Off when not set.
+# listen = "100.64.0.22:7878"
+
+reboot_command = ["systemctl", "reboot"]
+
+# auto: systemd-run when root under systemd, else setsid.
+launcher = "auto"

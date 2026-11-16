@@ -1,0 +1,11 @@
+confirm = true
+steps = [
+  "writers:maintenance_on",
+  "writers:backup",
+  "demo-os:snapshot",
+  "demo-os:upload",
+  "demo-os:update",
+  "all:verify",
+  "writers:maintenance_off",
+]
+on_failure = ["demo-os:restore", "all:verify", "writers:maintenance_off"]

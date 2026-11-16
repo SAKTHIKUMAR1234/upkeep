@@ -1,0 +1,21 @@
+name = "demo-os"
+run = "sh adapter.sh"
+writes_data = false
+
+[actions.snapshot]
+timeout = "5m"
+[actions.upload]
+timeout = "30m"
+needs = ["snapshot"]
+[actions.update]
+timeout = "60m"
+needs = ["snapshot"]
+[actions.restore]
+timeout = "30m"
+[actions.verify]
+timeout = "1m"
+
+[[service]]
+name = "upkeep runner"
+kind = "process"
+pattern = "upkeep.* serve"

@@ -1,0 +1,19 @@
+[Unit]
+Description=Upkeep runner
+Documentation=https://github.com/essdee/upkeep
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/upkeep serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+ConfigurationDirectory=upkeep
+StateDirectory=upkeep
+StateDirectoryMode=0700
+LogsDirectory=upkeep
+
+[Install]
+WantedBy=multi-user.target
