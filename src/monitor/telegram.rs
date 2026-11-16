@@ -113,6 +113,8 @@ pub async fn flush(db: &MonitorDb, telegram: &Telegram, now: i64) -> rusqlite::R
         match telegram.send(&pending.text).await {
             Ok(()) => {
                 db.delivered(pending.id)?;
+                let title = pending.text.lines().next().unwrap_or_default();
+                tracing::info!(id = pending.id, title, "alert sent");
                 sent += 1;
             }
             Err(error) => {
