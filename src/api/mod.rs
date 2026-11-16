@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, UnixListener};
 
 use crate::adapter::Catalog;
 use crate::engine::Runner;
+use crate::monitor::Monitor;
 use crate::paths::Paths;
 use crate::settings::Settings;
 use crate::store::Store;
@@ -25,6 +26,8 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     let _lock = lock_instance(&paths)?;
 
     let settings = Settings::load(&paths.settings_file())?;
+    let monitor_settings = settings.monitor.clone();
+    let host = settings.host_name();
     let tcp = match settings.listen {
         Some(address) => Some((address, Token::load(&paths.token_file())?)),
         None => None,
@@ -34,10 +37,12 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
     let store = Store::open(&paths.database())?;
     let runner = Arc::new(Runner::new(paths.clone(), settings, store));
     runner.resume()?;
+    let monitor = Arc::new(Monitor::new(runner.clone(), monitor_settings, host)?);
+    monitor.spawn();
 
     let unix = bind_socket(&paths)?;
     tracing::info!(socket = %paths.socket().display(), "listening on unix socket");
-    let local = axum::serve(unix, routes::local_router(runner.clone()));
+    let local = axum::serve(unix, routes::local_router(runner.clone(), monitor.clone()));
     let remote = async {
         let Some((address, token)) = tcp else {
             return std::future::pending().await;
@@ -46,7 +51,11 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("cannot listen on {address}"))?;
         tracing::info!(%address, "listening on tcp");
-        axum::serve(listener, routes::remote_router(runner.clone(), token)).await?;
+        axum::serve(
+            listener,
+            routes::remote_router(runner.clone(), monitor.clone(), token),
+        )
+        .await?;
         anyhow::Ok(())
     };
 

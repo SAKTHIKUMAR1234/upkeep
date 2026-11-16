@@ -29,6 +29,11 @@ impl Paths {
         self.state_dir.join("upkeep.db")
     }
 
+    /// Check states, their history and the alert outbox.
+    pub fn monitor_database(&self) -> PathBuf {
+        self.state_dir.join("monitor.db")
+    }
+
     pub fn socket(&self) -> PathBuf {
         self.state_dir.join("upkeep.sock")
     }

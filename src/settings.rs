@@ -3,6 +3,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::monitor::settings::MonitorSettings;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
     #[error("cannot read {path}: {source}")]
@@ -42,6 +44,8 @@ pub struct Settings {
     pub launcher: LauncherKind,
     /// Host name sent to adapters. Defaults to the system host name.
     pub host: Option<String>,
+    #[serde(default)]
+    pub monitor: MonitorSettings,
 }
 
 fn default_reboot_command() -> Vec<String> {
@@ -55,6 +59,7 @@ impl Default for Settings {
             reboot_command: default_reboot_command(),
             launcher: LauncherKind::Auto,
             host: None,
+            monitor: MonitorSettings::default(),
         }
     }
 }

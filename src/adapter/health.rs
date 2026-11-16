@@ -131,7 +131,7 @@ async fn check_ping(adapter: &Adapter, ping: &Ping, state_dir: &Path) -> Result<
     }
 }
 
-fn command(program: &str, args: &[&str]) -> Command {
+pub fn command(program: &str, args: &[&str]) -> Command {
     let mut command = Command::new(program);
     command
         .args(args)
@@ -143,7 +143,7 @@ fn command(program: &str, args: &[&str]) -> Command {
 }
 
 /// Runs a check command and returns its stdout, or why it failed.
-async fn run(command: &mut Command, timeout: Duration) -> Result<String, String> {
+pub async fn run(command: &mut Command, timeout: Duration) -> Result<String, String> {
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| format!("timed out after {}s", timeout.as_secs()))?

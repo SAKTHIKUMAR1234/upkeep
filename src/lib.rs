@@ -4,6 +4,7 @@ pub mod atomic_file;
 pub mod cli;
 pub mod client;
 pub mod engine;
+pub mod monitor;
 pub mod paths;
 pub mod plan;
 pub mod secrets;

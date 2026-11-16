@@ -257,6 +257,15 @@ impl Store {
             .optional()?)
     }
 
+    /// When the newest successful `snapshot` step finished.
+    pub fn last_snapshot_at(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self.lock().query_row(
+            "SELECT MAX(finished_at) FROM steps WHERE action = 'snapshot' AND status IN ('ok', 'degraded')",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn mark_step_running(&self, step: &Step) -> Result<(), StoreError> {
         self.lock().execute(
             "UPDATE steps SET status = 'running', started_at = ?4 WHERE job_id = ?1 AND phase = ?2 AND idx = ?3",

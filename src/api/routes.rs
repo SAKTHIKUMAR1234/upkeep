@@ -14,26 +14,30 @@ use super::auth::{Token, require_token};
 use super::log_stream;
 use crate::adapter::health;
 use crate::engine::{RunError, RunRequest, Runner};
+use crate::monitor::{Monitor, MonitorError};
 use crate::store::StoreError;
 
 #[derive(Clone)]
 struct ApiState {
     runner: Arc<Runner>,
+    monitor: Arc<Monitor>,
     requester: &'static str,
 }
 
 /// Routes for the local unix socket. File permissions on the socket guard access.
-pub fn local_router(runner: Arc<Runner>) -> Router {
+pub fn local_router(runner: Arc<Runner>, monitor: Arc<Monitor>) -> Router {
     router(ApiState {
         runner,
+        monitor,
         requester: "local",
     })
 }
 
 /// Routes for the TCP listener, behind the bearer token.
-pub fn remote_router(runner: Arc<Runner>, token: Token) -> Router {
+pub fn remote_router(runner: Arc<Runner>, monitor: Arc<Monitor>, token: Token) -> Router {
     let state = ApiState {
         runner,
+        monitor,
         requester: "api",
     };
     router(state).layer(middleware::from_fn_with_state(token, require_token))
@@ -48,6 +52,8 @@ fn router(state: ApiState) -> Router {
         .route("/jobs/{id}", get(job))
         .route("/jobs/{id}/log", get(job_log))
         .route("/jobs/{id}/cancel", post(cancel))
+        .route("/monitor", get(monitor))
+        .route("/monitor/alert-test", post(alert_test))
         .with_state(state)
 }
 
@@ -139,4 +145,27 @@ async fn cancel(
 ) -> Result<Json<Value>, ApiError> {
     state.runner.cancel(id)?;
     Ok(Json(json!({"id": id, "cancel_requested": true})))
+}
+
+fn monitor_error(error: MonitorError) -> Response {
+    let status = match error {
+        MonitorError::NoTelegram => StatusCode::CONFLICT,
+        MonitorError::Send(_) => StatusCode::BAD_GATEWAY,
+        MonitorError::Database(_) | MonitorError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({"error": error.to_string()}))).into_response()
+}
+
+async fn monitor(State(state): State<ApiState>) -> Response {
+    match state.monitor.report() {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => monitor_error(error),
+    }
+}
+
+async fn alert_test(State(state): State<ApiState>) -> Response {
+    match state.monitor.send_test().await {
+        Ok(()) => Json(json!({"sent": true})).into_response(),
+        Err(error) => monitor_error(error),
+    }
 }
