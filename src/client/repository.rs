@@ -55,6 +55,14 @@ impl Repository {
         })
     }
 
+    /// Why restic could not start, naming the binary that was tried.
+    pub fn engine_error(&self) -> String {
+        format!(
+            "cannot run restic at {}: install it or set UPKEEP_RESTIC",
+            self.engine.display()
+        )
+    }
+
     /// `restic -r <repository> <args>` with the SSH and key settings in place.
     pub fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(&self.engine);

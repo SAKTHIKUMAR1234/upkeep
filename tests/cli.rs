@@ -46,3 +46,42 @@ fn a_closed_output_pipe_ends_the_client_without_a_panic() {
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert_ne!(status.code(), Some(101), "{stderr}");
 }
+
+#[test]
+fn a_missing_restic_is_named_in_the_error() {
+    let client_dir = tempfile::tempdir().unwrap();
+    let key = client_dir.path().join("dest_key");
+    std::fs::write(&key, "not a real key\n").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let upkeep = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_upkeep"))
+            .arg("--client-dir")
+            .arg(client_dir.path())
+            .env("UPKEEP_RESTIC", "/nonexistent/restic")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let added = upkeep(&[
+        "dest",
+        "add",
+        "laptop",
+        "--ssh",
+        "backup@127.0.0.1",
+        "--path",
+        "/srv/backups",
+        "--key",
+        key.to_str().unwrap(),
+        "--host-key",
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+    ]);
+    assert!(added.status.success(), "{added:?}");
+
+    let listed = upkeep(&["snapshots", "vm-a", "--dest", "laptop"]);
+    let stderr = String::from_utf8_lossy(&listed.stderr);
+    assert!(!listed.status.success());
+    assert!(
+        stderr.contains("cannot run restic at /nonexistent/restic"),
+        "{stderr}"
+    );
+}

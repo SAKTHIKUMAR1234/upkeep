@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
+use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -76,7 +77,8 @@ pub fn list(dir: &ClientDir, host: &str, dest: Option<&str>) -> anyhow::Result<(
     let output = repository
         .command(&["snapshots", "--json"])
         .stderr(Stdio::inherit())
-        .output()?;
+        .output()
+        .with_context(|| repository.engine_error())?;
     anyhow::ensure!(
         output.status.success(),
         "restic snapshots failed: {}",
@@ -108,7 +110,10 @@ pub fn restore(
     if let Some(path) = path {
         args.extend(["--include", path]);
     }
-    let status = repository.command(&args).status()?;
+    let status = repository
+        .command(&args)
+        .status()
+        .with_context(|| repository.engine_error())?;
     anyhow::ensure!(status.success(), "restic restore failed: {status}");
     println!(
         "restored {snapshot}{} of {host} into {target}",
