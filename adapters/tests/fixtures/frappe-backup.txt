@@ -1,0 +1,6 @@
+Backup Summary for site.local at 2026-11-16 14:02:11.123456
+Config  : ./site.local/private/backups/20261116_140210-site_local-site_config_backup.json 94.0B
+Database: ./site.local/private/backups/20261116_140210-site_local-database.sql.gz         1.2MiB
+Public  : ./site.local/private/backups/20261116_140210-site_local-files.tar               10.0KiB
+Private : ./site.local/private/backups/20261116_140210-site_local-private-files.tar       10.0KiB
+Backup for Site site.local has been successfully completed with files
