@@ -180,13 +180,12 @@ def check_service(service: dict) -> str | None:
     """Checks one manifest [[service]]; returns why it failed, or None."""
     kind = service.get("kind")
     commands = {
-        "systemd": lambda: ["systemctl", "is-active", "--quiet", service["unit"]],
+        "systemd": lambda: ["systemctl", "is-active", service["unit"]],
         "systemd-user": lambda: [
             "systemctl",
             "--user",
             f"--machine={service['user']}@",
             "is-active",
-            "--quiet",
             service["unit"],
         ],
         "docker": lambda: ["docker", "inspect", "--format", "{{.State.Running}}", service["container"]],

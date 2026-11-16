@@ -76,13 +76,10 @@ fn item(adapter: &str, kind: &'static str, name: &str, result: Result<(), String
 
 async fn check_service(service: &Service) -> Result<(), String> {
     let mut command = match service {
-        Service::Systemd { unit, .. } => command("systemctl", &["is-active", "--quiet", unit]),
+        Service::Systemd { unit, .. } => command("systemctl", &["is-active", unit]),
         Service::SystemdUser { unit, user, .. } => {
             let machine = format!("--machine={user}@");
-            command(
-                "systemctl",
-                &["--user", &machine, "is-active", "--quiet", unit],
-            )
+            command("systemctl", &["--user", &machine, "is-active", unit])
         }
         Service::Docker { container, .. } => command(
             "docker",

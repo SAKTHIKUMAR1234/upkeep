@@ -178,6 +178,14 @@ class HealthTest(unittest.TestCase):
 
         self.assertEqual(failures, ["service ghost: exit code 1", "ping no: exit code 1"])
 
+    def test_a_stopped_systemd_unit_reports_its_state(self):
+        def systemctl(command, timeout):
+            return 3, "" if "--quiet" in command else "failed\n"
+
+        with mock.patch.object(upkeep_adapter, "run_check", side_effect=systemctl):
+            failure = upkeep_adapter.check_service({"kind": "systemd", "unit": "testapp.service"})
+        self.assertEqual(failure, "failed")
+
     def test_unknown_service_kind(self):
         self.assertEqual(upkeep_adapter.check_service({"kind": "windows"}), "unknown service kind 'windows'")
 
