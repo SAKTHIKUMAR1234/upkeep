@@ -1,0 +1,10 @@
+name = "os"
+run = "python3 /usr/local/lib/upkeep/adapters/ubuntu-os/ubuntu_os.py"
+
+[actions.verify]
+timeout = "2m"
+
+[[service]]
+name = "ssh"
+kind = "systemd"
+unit = "ssh.service"
