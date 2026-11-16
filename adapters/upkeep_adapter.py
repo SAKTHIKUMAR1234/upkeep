@@ -50,6 +50,22 @@ class Context:
     def state_dir(self) -> Path:
         return Path(self.data.get("state_dir") or os.environ.get("UPKEEP_STATE_DIR") or ".")
 
+    @property
+    def params(self) -> dict:
+        """Non-secret values the client sent with the job, such as the snapshot destination."""
+        return self.data.get("params") or {}
+
+    @property
+    def secrets(self) -> dict:
+        """Secret values the client sent with the job. Never log them; the runner redacts them as well."""
+        path = self.data.get("secrets_file")
+        if not path:
+            return {}
+        try:
+            return json.loads(Path(path).read_text())
+        except FileNotFoundError:
+            return {}
+
 
 def emit(kind: str, **fields) -> None:
     print(json.dumps({"type": kind, **fields}), flush=True)

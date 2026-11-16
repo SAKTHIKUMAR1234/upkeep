@@ -56,6 +56,19 @@ class ContextTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             context = upkeep_adapter.load_context(Path(directory), io.StringIO(""))
         self.assertEqual((context.data, context.manifest, context.config), ({}, {}, {}))
+        self.assertEqual((context.params, context.secrets), ({}, {}))
+
+    def test_reads_params_and_the_secrets_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            secrets_file = Path(directory) / "7.json"
+            secrets_file.write_text(json.dumps({"repository_key": "k"}))
+            data = {"params": {"destination": {"name": "laptop"}}, "secrets_file": str(secrets_file)}
+            context = Context(data=data, adapter_dir=Path(directory))
+
+            self.assertEqual(context.params["destination"]["name"], "laptop")
+            self.assertEqual(context.secrets, {"repository_key": "k"})
+            secrets_file.unlink()
+            self.assertEqual(context.secrets, {})
 
 
 class RunTest(unittest.TestCase):

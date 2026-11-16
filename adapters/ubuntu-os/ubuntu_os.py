@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upkeep adapter for an Ubuntu host: apt updates, failed units, service discovery."""
+"""Upkeep adapter for an Ubuntu host: apt updates, failed units, service discovery and snapshots."""
 
 import re
 import shutil
@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import snapshots
 from upkeep_adapter import (
     EXIT_REBOOT,
     AdapterError,
@@ -208,4 +209,14 @@ def discover(context: Context) -> None:
 
 
 if __name__ == "__main__":
-    main({"check_updates": check_updates, "update": update, "verify": verify, "discover": discover})
+    main(
+        {
+            "check_updates": check_updates,
+            "update": update,
+            "verify": verify,
+            "discover": discover,
+            "snapshot": snapshots.snapshot,
+            "retention": snapshots.retention,
+            "restore": snapshots.restore,
+        }
+    )
