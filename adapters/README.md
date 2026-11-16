@@ -12,6 +12,7 @@ Actions: `check_updates`, `update` (exit 10 when a reboot is required: `/run/reb
 |---|---|---|
 | `hold` | `[]` | Package name patterns (shell globs, for example `"mariadb-*"`) held with `apt-mark hold` during `update`. Packages that were held before stay held; the others are released after the update. |
 | `ignore_failed_units` | `[]` | Unit name patterns that `verify` does not count as failed. |
+| `verify_wait` | `"5m"` | How long `verify` checks again (every 15 s) before it fails, so services can start after a reboot. The frappe-bench adapter has the same field. |
 
 ### Snapshots
 
@@ -36,7 +37,9 @@ Stop the databases before `snapshot` (for example with `writers:maintenance_on`)
 
 ## frappe-bench
 
-Actions: `maintenance_on`, `maintenance_off`, `backup`, `check_updates`, `update`, `verify`. Give `update` `needs = ["maintenance_on", "backup"]` in `adapter.toml`.
+Actions: `maintenance_on`, `maintenance_off`, `backup`, `check_updates`, `update`, `rollback`, `verify`. Give `update` `needs = ["maintenance_on", "backup"]` in `adapter.toml`.
+
+`backup` starts an update: it saves each site's database file in `<state_dir>/update_state.json`. `update` refuses to run without it and saves each app's commit before it pulls. `rollback` resets the apps to those commits, restores the databases with `frappe restore` and restarts the bench. It does nothing when `update` did not start. Put it first in the plan's `on_failure`.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -47,6 +50,8 @@ Actions: `maintenance_on`, `maintenance_off`, `backup`, `check_updates`, `update
 | `skip_apps` | `[]` | Apps that `check_updates` and `update` leave alone, for example private apps the server cannot fetch. |
 | `user` | runner user | Runs Pilot and git as this user. The runner must be root to switch users. |
 | `job_wait_timeout` | `"10m"` | How long `maintenance_on` waits for running background jobs. |
+| `restore.db_root_password_file` | required for `rollback` | File with the MariaDB root password for `frappe restore`. It never goes to the log. |
+| `restore.db_root_username` | `"root"` | MariaDB root user for `frappe restore`. |
 | `restart` | `true` | `update` runs `pilot restart` at the end. Set `false` for a development bench. |
 | `backup.with_files` | `true` | Adds `--with-files` to `backup`. |
 | `backup.compress` | `false` | Adds `--compress` to `backup`. |

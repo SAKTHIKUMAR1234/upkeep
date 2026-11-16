@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -23,6 +24,8 @@ EXIT_UNKNOWN_ACTION = 2
 MANIFEST_FILE = "adapter.toml"
 CONFIG_FILE = "adapter.conf.toml"
 DEFAULT_CHECK_TIMEOUT = 10.0
+DEFAULT_VERIFY_WAIT = 300.0
+VERIFY_RETRY_INTERVAL = 15
 
 
 class AdapterError(Exception):
@@ -236,6 +239,17 @@ def run_check(command: list[str], timeout: float, cwd: Path | None = None) -> tu
     except FileNotFoundError as error:
         return 127, str(error)
     return completed.returncode, completed.stderr + completed.stdout
+
+
+def wait_until_healthy(context: Context, check: Callable[[], list[str]]) -> list[str]:
+    """Repeats `check` until it finds no problem or `verify_wait` (default 5m) passes; returns the last problems."""
+    deadline = time.monotonic() + parse_duration(context.config.get("verify_wait"), default=DEFAULT_VERIFY_WAIT)
+    while True:
+        problems = check()
+        if not problems or time.monotonic() >= deadline:
+            return problems
+        log(f"{len(problems)} checks not ready yet; checking again in {VERIFY_RETRY_INTERVAL}s", level="warn")
+        time.sleep(VERIFY_RETRY_INTERVAL)
 
 
 def check_manifest_health(context: Context) -> list[str]:

@@ -190,5 +190,21 @@ class HealthTest(unittest.TestCase):
         self.assertEqual(upkeep_adapter.check_service({"kind": "windows"}), "unknown service kind 'windows'")
 
 
+class WaitUntilHealthyTest(unittest.TestCase):
+    def test_checks_again_until_the_problems_clear(self):
+        answers = iter([["ping site: refused"], []])
+        context = Context(data={}, adapter_dir=Path("."), config={"verify_wait": "1m"})
+        with mock.patch.object(upkeep_adapter.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()):
+            problems = upkeep_adapter.wait_until_healthy(context, lambda: next(answers))
+        self.assertEqual(problems, [])
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_returns_the_last_problems_after_the_wait(self):
+        context = Context(data={}, adapter_dir=Path("."), config={"verify_wait": 0})
+        with contextlib.redirect_stdout(io.StringIO()):
+            problems = upkeep_adapter.wait_until_healthy(context, lambda: ["ping site: refused"])
+        self.assertEqual(problems, ["ping site: refused"])
+
+
 if __name__ == "__main__":
     unittest.main()

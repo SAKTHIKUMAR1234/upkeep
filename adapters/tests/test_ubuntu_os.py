@@ -82,7 +82,7 @@ class UnitsTest(unittest.TestCase):
             self.assertEqual(ubuntu_os.failed_units(["fwupd-*"]), ["motd-news.service"])
 
     def test_verify_fails_on_a_failed_unit(self):
-        context = Context(data={}, adapter_dir=Path("."), config={"ignore_failed_units": ["fwupd-*"]})
+        context = Context(data={}, adapter_dir=Path("."), config={"ignore_failed_units": ["fwupd-*"], "verify_wait": 0})
         with (
             mock.patch.object(ubuntu_os, "run", return_value=fixture("systemctl-failed.txt")),
             contextlib.redirect_stdout(io.StringIO()),

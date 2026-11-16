@@ -182,28 +182,73 @@ class MaintenanceTest(unittest.TestCase):
 
 
 class UpdateTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.state_dir = Path(temporary.name)
+
+    def context(self, **config) -> Context:
+        return Context(data={"state_dir": str(self.state_dir)}, adapter_dir=Path("."), config={**CONFIG, **config})
+
+    def write_state(self, state: dict) -> None:
+        (self.state_dir / frappe_bench.UPDATE_STATE_FILE).write_text(json.dumps(state))
+
+    def run_action(self, action, shell: FakeShell, context: Context) -> None:
+        with mock.patch.object(frappe_bench, "run", shell), contextlib.redirect_stdout(io.StringIO()):
+            action(context)
+
+    def test_refuses_to_update_without_a_backup(self):
+        shell = FakeShell({("list-apps",): "frappe\n"})
+        with self.assertRaises(AdapterError):
+            self.run_action(frappe_bench.update, shell, self.context())
+        self.assertFalse(any("pull" in command for command in shell.commands))
+
     def test_stops_at_the_first_failed_pull(self):
+        self.write_state({"databases": {"a.local": "a.sql.gz"}})
         pull_failed = CommandError(["git", "pull", "--ff-only"], 128, "fatal: Not possible to fast-forward")
         shell = FakeShell({("list-apps",): "frappe\nhrms\n", ("pull", "--ff-only"): pull_failed})
-        context = Context(data={}, adapter_dir=Path("."), config=CONFIG)
-        with (
-            mock.patch.object(frappe_bench, "run", shell),
-            contextlib.redirect_stdout(io.StringIO()),
-            self.assertRaises(CommandError),
-        ):
-            frappe_bench.update(context)
+        with self.assertRaises(CommandError):
+            self.run_action(frappe_bench.update, shell, self.context())
 
         self.assertEqual(sum("pull" in command for command in shell.commands), 1)
         self.assertEqual(shell.frappe_calls(), [])
 
     def test_skipped_apps_are_not_pulled(self):
+        self.write_state({"databases": {"a.local": "a.sql.gz"}})
         shell = FakeShell({("list-apps",): "frappe\nprivate_app\nhrms\n"})
-        context = Context(data={}, adapter_dir=Path("."), config={**CONFIG, "skip_apps": ["private_app"]})
-        with mock.patch.object(frappe_bench, "run", shell), contextlib.redirect_stdout(io.StringIO()):
-            frappe_bench.update(context)
+        self.run_action(frappe_bench.update, shell, self.context(skip_apps=["private_app"]))
 
         pulled = [command[command.index("-C") + 1] for command in shell.commands if "pull" in command]
         self.assertEqual(pulled, ["/benches/main/apps/frappe", "/benches/main/apps/hrms"])
+
+    def test_rollback_resets_apps_and_restores_the_backup(self):
+        password_file = self.state_dir / "root-password"
+        password_file.write_text("s3cret\n")
+        self.write_state({"databases": {"a.local": "a/private/backups/db.sql.gz"}, "apps": {"frappe": "abc123"}})
+        shell = FakeShell({})
+        context = self.context(restore={"db_root_password_file": str(password_file)}, restart=False)
+        self.run_action(frappe_bench.rollback, shell, context)
+
+        self.assertIn(["git", "-C", "/benches/main/apps/frappe", "reset", "--hard", "abc123"], shell.commands)
+        restore = shell.frappe_calls()[0]
+        self.assertEqual(restore[:4], ("a.local", "restore", "a/private/backups/db.sql.gz", "--force"))
+        self.assertFalse((self.state_dir / frappe_bench.UPDATE_STATE_FILE).exists())
+
+    def test_failed_restore_hides_the_root_password(self):
+        password_file = self.state_dir / "root-password"
+        password_file.write_text("s3cret")
+        self.write_state({"databases": {"a.local": "db.sql.gz"}, "apps": {}})
+        failed = CommandError(["pilot", "restore", "--db-root-password", "s3cret"], 1, "Access denied, used s3cret")
+        shell = FakeShell({("--db-root-password", "s3cret"): failed})
+        context = self.context(restore={"db_root_password_file": str(password_file)})
+        with self.assertRaises(AdapterError) as raised:
+            self.run_action(frappe_bench.rollback, shell, context)
+        self.assertNotIn("s3cret", str(raised.exception))
+
+    def test_rollback_without_an_update_changes_nothing(self):
+        shell = FakeShell({})
+        self.run_action(frappe_bench.rollback, shell, self.context())
+        self.assertEqual(shell.commands, [])
 
 
 if __name__ == "__main__":

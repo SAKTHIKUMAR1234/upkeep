@@ -19,6 +19,7 @@ from upkeep_adapter import (
     matches_any,
     result,
     run,
+    wait_until_healthy,
 )
 
 RISKY_PREFIXES = (
@@ -158,13 +159,17 @@ def failed_units(ignore: list[str]) -> list[str]:
 
 
 def verify(context: Context) -> None:
-    problems = [f"failed unit {unit}" for unit in failed_units(context.config.get("ignore_failed_units", []))]
-    for problem in problems:
-        log(problem, level="error")
-    problems += check_manifest_health(context)
+    problems = wait_until_healthy(context, lambda: check_health(context))
     if problems:
         raise AdapterError(f"verify failed: {'; '.join(problems)}")
     log("all checks passed")
+
+
+def check_health(context: Context) -> list[str]:
+    problems = [f"failed unit {unit}" for unit in failed_units(context.config.get("ignore_failed_units", []))]
+    for problem in problems:
+        log(problem, level="error")
+    return problems + check_manifest_health(context)
 
 
 def parse_unit_names(output: str) -> list[str]:

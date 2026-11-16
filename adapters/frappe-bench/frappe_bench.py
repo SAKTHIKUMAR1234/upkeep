@@ -23,9 +23,11 @@ from upkeep_adapter import (
     parse_duration,
     result,
     run,
+    wait_until_healthy,
 )
 
 SITE_STATE_FILE = "site_state.json"
+UPDATE_STATE_FILE = "update_state.json"
 JOB_WAIT_INTERVAL = 5
 BACKUP_LINE = re.compile(r"^(Config|Database|Public|Private)\s*:\s*(\S+)")
 
@@ -174,12 +176,17 @@ def backup(context: Context) -> None:
     flags += ["--compress"] if options.get("compress", False) else []
     flags += ["--backup-path", options["path"]] if options.get("path") else []
 
+    sites_dir = bench.directory / "sites"
     backups = {}
     for site in bench.sites:
-        files = parse_backup_summary(bench.frappe(site, "backup", *flags), bench.directory / "sites")
+        files = parse_backup_summary(bench.frappe(site, "backup", *flags), sites_dir)
         if "database" not in files:
             raise AdapterError(f"{site}: backup finished but printed no database file")
         backups[site] = files
+
+    # A new backup starts a new update: rollback returns to this point.
+    databases = {site: os.path.relpath(files["database"], sites_dir) for site, files in backups.items()}
+    write_site_state(context.state_dir / UPDATE_STATE_FILE, {"databases": databases})
     result(backups=backups)
 
 
@@ -239,6 +246,14 @@ def check_updates(context: Context) -> int | None:
 
 def update(context: Context) -> None:
     bench = Bench(context.config)
+    state_file = context.state_dir / UPDATE_STATE_FILE
+    state = read_site_state(state_file)
+    if "databases" not in state:
+        raise AdapterError("no backup from this update: run backup first")
+    if "apps" not in state:
+        state["apps"] = {app: bench.git(app, "rev-parse", "HEAD", quiet=True).strip() for app in bench.apps}
+        write_site_state(state_file, state)
+
     pulled = []
     for app in bench.apps:
         before = bench.git(app, "rev-parse", "HEAD", quiet=True).strip()
@@ -255,8 +270,58 @@ def update(context: Context) -> None:
     result(apps=pulled, migrated=bench.sites, restarted=restart)
 
 
+def rollback(context: Context) -> None:
+    """Puts the apps back on their commits from before update and restores the backup update started from."""
+    bench = Bench(context.config)
+    state_file = context.state_dir / UPDATE_STATE_FILE
+    state = read_site_state(state_file)
+    if "apps" not in state:
+        log("update did not start: nothing to roll back")
+        return
+
+    for app, commit in state["apps"].items():
+        bench.git(app, "reset", "--hard", commit)
+    for site, database in state["databases"].items():
+        restore_database(bench, context.config.get("restore", {}), site, database)
+    if context.config.get("restart", True):
+        bench.pilot("restart")
+    state_file.unlink()
+    result(apps=state["apps"], restored=state["databases"])
+
+
+def restore_database(bench: Bench, options: dict, site: str, database: str) -> None:
+    """Runs `frappe restore`; the root password stays out of the log."""
+    password_file = options.get("db_root_password_file")
+    if not password_file:
+        raise AdapterError("adapter.conf.toml is missing: restore.db_root_password_file")
+    password = Path(password_file).read_text().strip()
+    log(f"{site}: restoring {database}")
+    try:
+        bench.frappe(
+            site,
+            "restore",
+            database,
+            "--force",
+            "--db-root-username",
+            options.get("db_root_username", "root"),
+            "--db-root-password",
+            password,
+            quiet=True,
+        )
+    except CommandError as error:
+        output = "\n".join(error.output.replace(password, "***").strip().splitlines()[-5:])
+        raise AdapterError(f"{site}: restore failed with exit code {error.code}: {output}") from None
+    log(f"{site}: restored")
+
+
 def verify(context: Context) -> None:
     bench = Bench(context.config)
+    problems = wait_until_healthy(context, lambda: check_health(context, bench))
+    if problems:
+        raise AdapterError(f"verify failed: {'; '.join(problems)}")
+
+
+def check_health(context: Context, bench: Bench) -> list[str]:
     problems = check_manifest_health(context)
     for site in bench.sites:
         try:
@@ -268,8 +333,7 @@ def verify(context: Context) -> None:
         else:
             problems.append(f"{site}: frappe.ping failed: {answer.strip()[-300:]}")
             log(problems[-1], level="error")
-    if problems:
-        raise AdapterError(f"verify failed: {'; '.join(problems)}")
+    return problems
 
 
 if __name__ == "__main__":
@@ -280,6 +344,7 @@ if __name__ == "__main__":
             "backup": backup,
             "check_updates": check_updates,
             "update": update,
+            "rollback": rollback,
             "verify": verify,
         }
     )
