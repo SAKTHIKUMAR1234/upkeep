@@ -41,6 +41,13 @@ pub struct Plan {
     pub steps: Vec<String>,
     #[serde(default)]
     pub on_failure: Vec<String>,
+    /// Send Telegram messages when a job of this plan starts and ends.
+    #[serde(default = "yes")]
+    pub notify: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// One adapter action, resolved against the catalog, ready to store and run.
@@ -81,6 +88,12 @@ impl Plan {
         };
         toml::from_str(&text).map_err(|error| read_error(error.to_string()))
     }
+}
+
+/// A job announces its start and end when it runs a plan that does not set `notify = false`.
+/// A single `adapter:action` is not announced.
+pub fn notifies(target: &str, plans_dir: &Path) -> bool {
+    !target.contains(':') && Plan::load(plans_dir, target).map_or(true, |plan| plan.notify)
 }
 
 impl JobPlan {
@@ -327,5 +340,20 @@ mod tests {
             JobPlan::resolve("missing", &catalog(), dir.path()).unwrap_err(),
             PlanError::UnknownPlan("missing".into())
         );
+    }
+
+    #[test]
+    fn plans_notify_unless_they_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loud.toml"), "steps = [\"a:b\"]\n").unwrap();
+        std::fs::write(
+            dir.path().join("quiet.toml"),
+            "steps = [\"a:b\"]\nnotify = false\n",
+        )
+        .unwrap();
+        assert!(notifies("loud", dir.path()));
+        assert!(!notifies("quiet", dir.path()));
+        assert!(!notifies("os:update", dir.path()));
+        assert!(notifies("removed", dir.path()));
     }
 }

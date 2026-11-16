@@ -14,9 +14,11 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::sync::Notify;
+use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::adapter::health;
-use crate::engine::Runner;
+use crate::engine::{JobEvent, Runner};
+use crate::plan;
 use crate::settings::Settings;
 use crate::store::StoreError;
 use crate::time::now_unix;
@@ -89,9 +91,11 @@ impl Monitor {
         })
     }
 
-    /// Starts the check rounds and the outbox delivery.
+    /// Starts the check rounds, the job messages and the outbox delivery.
+    /// Call it before the runner resumes a job, so that its end is announced.
     pub fn spawn(self: &Arc<Self>) {
         tokio::spawn(self.clone().check_forever());
+        tokio::spawn(self.clone().announce_jobs(self.runner.subscribe()));
         tokio::spawn(self.clone().deliver_forever());
     }
 
@@ -148,6 +152,48 @@ impl Monitor {
                 () = tokio::time::sleep(DELIVERY_TICK) => {}
             }
         }
+    }
+
+    async fn announce_jobs(self: Arc<Self>, mut events: broadcast::Receiver<JobEvent>) {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if let Err(error) = self.announce_job(event) {
+                        tracing::error!(%error, "cannot queue the job message");
+                    }
+                }
+                Err(RecvError::Lagged(missed)) => tracing::warn!(missed, "job messages skipped"),
+                Err(RecvError::Closed) => return,
+            }
+        }
+    }
+
+    /// Queues the start or end message of a plan's job.
+    fn announce_job(&self, event: JobEvent) -> Result<(), MonitorError> {
+        let active = self.active();
+        if active.telegram.is_none() {
+            return Ok(());
+        }
+        let (job_id, started) = match event {
+            JobEvent::Started(job_id) => (job_id, true),
+            JobEvent::Finished(job_id) => (job_id, false),
+        };
+        let store = self.runner.store();
+        let job = store.job(job_id)?;
+        if !plan::notifies(&job.target, &self.runner.paths().plans_dir()) {
+            return Ok(());
+        }
+        let steps = store.steps(job_id)?;
+        let letterhead = self.letterhead(&active.settings);
+        let now = now_unix();
+        let text = if started {
+            letterhead.job_started(&job, &steps)
+        } else {
+            letterhead.job_finished(&job, &steps, now)
+        };
+        self.db.enqueue(&text, now)?;
+        self.outbox_changed.notify_one();
+        Ok(())
     }
 
     /// One round: observe, move each check's state, save it and queue the messages it asks for.

@@ -36,9 +36,9 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
 
     let store = Store::open(&paths.database())?;
     let runner = Arc::new(Runner::new(paths.clone(), settings, store));
-    runner.resume()?;
     let monitor = Arc::new(Monitor::new(runner.clone(), monitor_settings, host)?);
     monitor.spawn();
+    runner.resume()?;
 
     let unix = bind_socket(&paths)?;
     tracing::info!(socket = %paths.socket().display(), "listening on unix socket");

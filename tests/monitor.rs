@@ -347,3 +347,65 @@ async fn alert_test_and_status_all_from_the_cli() {
     let one = client(&["--host", "vm", "status"]);
     assert!(one.contains("ping:demo-app/demo-app answers"), "{one}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_jobs_announce_their_start_and_end() {
+    let bot = FakeBot::default();
+    let api_url = bot.start().await;
+    let mut harness = Harness::new();
+    let monitor = "enabled = false\ndisplay_name = \"YRP server (.22)\"";
+    harness.write_settings(&monitor_settings(&harness, &api_url, monitor, ""));
+    harness.add_adapter(
+        "quick",
+        "[actions.first]\n[actions.second]\n[actions.broken]\n[actions.cleanup]\n",
+        "[ \"$1\" != broken ]\n",
+    );
+    harness.add_plan("good", "steps = [\"quick:first\", \"quick:second\"]\n");
+    harness.add_plan(
+        "bad",
+        "steps = [\"quick:first\", \"quick:broken\", \"quick:second\"]\non_failure = [\"quick:cleanup\"]\n",
+    );
+    harness.add_plan("quiet", "steps = [\"quick:first\"]\nnotify = false\n");
+    harness.start().await;
+
+    let id = harness.run("good", false).await.unwrap();
+    harness.wait_for_status(id, "succeeded").await;
+    let started = bot
+        .expect(
+            &harness,
+            "<b>🛠️ UPDATE STARTED · YRP server (.22)</b>\n",
+            "<b>good</b>",
+        )
+        .await;
+    assert!(
+        started.ends_with("2 steps: <code>quick:first</code>, <code>quick:second</code>"),
+        "{started}"
+    );
+    bot.expect(
+        &harness,
+        "<b>✅ UPDATE DONE · YRP server (.22)</b>\n",
+        "<b>good</b> · all 2 steps done",
+    )
+    .await;
+
+    let id = harness.run("bad", false).await.unwrap();
+    harness.wait_for_status(id, "failed").await;
+    let failed = bot
+        .expect(
+            &harness,
+            "<b>❌ UPDATE FAILED · YRP server (.22)</b>\n",
+            "Failed at step 2/3 <code>quick:broken</code>: exit code 1",
+        )
+        .await;
+    assert!(
+        failed.contains("\nRecovery: 1 step ran, all OK\n"),
+        "{failed}"
+    );
+
+    let id = harness.run("quiet", false).await.unwrap();
+    harness.wait_for_status(id, "succeeded").await;
+    let id = harness.run("quick:first", false).await.unwrap();
+    harness.wait_for_status(id, "succeeded").await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert_eq!(bot.texts().len(), 4, "{:?}", bot.texts());
+}

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::process::Command;
+use tokio::sync::broadcast;
 
 use crate::adapter::Catalog;
 use crate::paths::Paths;
@@ -24,6 +25,14 @@ use step_dir::{ExitRecord, StepDir, StepFile, current_boot_id};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const START_GRACE: Duration = Duration::from_secs(15);
+const EVENT_BUFFER: usize = 64;
+
+/// A job started or finished. The monitor announces these on Telegram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobEvent {
+    Started(i64),
+    Finished(i64),
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -69,6 +78,7 @@ pub struct Runner {
     store: Store,
     launcher: Launcher,
     host: String,
+    events: broadcast::Sender<JobEvent>,
 }
 
 impl Runner {
@@ -79,7 +89,18 @@ impl Runner {
             paths,
             settings,
             store,
+            events: broadcast::channel(EVENT_BUFFER).0,
         }
+    }
+
+    /// Job starts and ends from now on.
+    pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
+        self.events.subscribe()
+    }
+
+    fn announce(&self, event: JobEvent) {
+        // An error only means that nobody listens.
+        let _ = self.events.send(event);
     }
 
     pub fn paths(&self) -> &Paths {
@@ -126,6 +147,7 @@ impl Runner {
             ),
         );
         tracing::info!(job_id, target = %plan.target, "job started");
+        self.announce(JobEvent::Started(job_id));
         self.spawn_drive(job_id);
         Ok(job_id)
     }
@@ -171,12 +193,12 @@ impl Runner {
                 tracing::error!(job_id, %error, "job aborted");
                 runner.log(job_id, &format!("job aborted: {error}"));
                 runner.forget_secrets(job_id);
-                if let Err(error) =
-                    runner
-                        .store
-                        .finish_job(job_id, JobStatus::Failed, Some(&error.to_string()))
+                match runner
+                    .store
+                    .finish_job(job_id, JobStatus::Failed, Some(&error.to_string()))
                 {
-                    tracing::error!(job_id, %error, "cannot mark job failed");
+                    Ok(()) => runner.announce(JobEvent::Finished(job_id)),
+                    Err(error) => tracing::error!(job_id, %error, "cannot mark job failed"),
                 }
             }
         });
@@ -233,6 +255,7 @@ impl Runner {
             Phase::Main => JobStatus::Succeeded,
         };
         self.store.finish_job(job.id, status, None)?;
+        self.announce(JobEvent::Finished(job.id));
         self.forget_secrets(job.id);
         self.log(job.id, &format!("job finished: {}", status.as_str()));
         tracing::info!(job_id = job.id, status = status.as_str(), "job finished");
