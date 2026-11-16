@@ -288,3 +288,67 @@ async fn log_follow_streams_until_the_job_ends() {
     assert!(log.contains("step main slow:wait started"));
     assert!(log.trim_end().ends_with("job finished: succeeded"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn job_secrets_reach_the_adapter_but_never_the_log_or_database() {
+    let mut harness = Harness::new();
+    harness.add_adapter(
+        "vault",
+        "[actions.leak]\n",
+        "cat > \"$UPKEEP_STATE_DIR/context.json\"\n\
+         file=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"secrets_file\"])' \"$UPKEEP_STATE_DIR/context.json\")\n\
+         password=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"ssh_password\"])' \"$file\")\n\
+         echo \"stdout has $password\"\n\
+         echo \"stderr has $password\" >&2\n\
+         printf '{\"type\":\"result\",\"echo\":\"%s\"}\\n' \"$password\"\n",
+    );
+    harness.start().await;
+
+    let request = serde_json::json!({
+        "target": "vault:leak",
+        "params": {"destination": {"name": "laptop"}},
+        "secrets": {"ssh_password": "pa55-word-xyz"},
+    });
+    let started = harness.client().post("/run", &request).await.unwrap();
+    let id = started["id"].as_i64().unwrap();
+    let detail = harness.wait_for_status(id, "succeeded").await;
+
+    assert_eq!(detail["job"]["params"]["destination"]["name"], "laptop");
+    assert_eq!(detail["steps"][0]["result"]["echo"], "[redacted]");
+
+    let context: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(harness.adapter_state("vault").join("context.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(context["params"]["destination"]["name"], "laptop");
+    let secrets_file = std::path::PathBuf::from(context["secrets_file"].as_str().unwrap());
+    assert!(
+        !secrets_file.exists(),
+        "secrets file is deleted when the job ends"
+    );
+
+    let log_dir = harness.log_dir().join(format!("jobs/{id}"));
+    let log = std::fs::read_to_string(log_dir.join("job.log")).unwrap();
+    assert!(log.contains("stdout has [redacted]") && log.contains("stderr has [redacted]"));
+    for path in walk(&log_dir).into_iter().chain(walk(&harness.state_dir())) {
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("pa55-word-xyz"),
+            "secret found in {}",
+            path.display()
+        );
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(walk(&path));
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    files
+}

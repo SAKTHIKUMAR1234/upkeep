@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     error TEXT,
     reboot_boot_id TEXT,
     created_at INTEGER NOT NULL,
-    finished_at INTEGER
+    finished_at INTEGER,
+    params TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_job
     ON jobs (status IN ('running', 'rebooting')) WHERE status IN ('running', 'rebooting');
@@ -120,6 +121,8 @@ pub struct Job {
     pub reboot_boot_id: Option<String>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
+    /// Non-secret values the client sent for the adapters, such as the snapshot destination.
+    pub params: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -150,7 +153,7 @@ pub struct StepOutcome {
 }
 
 const JOB_COLUMNS: &str = "id, target, status, phase, end_status, cancel_requested, requested_by, error, \
-     reboot_boot_id, created_at, finished_at";
+     reboot_boot_id, created_at, finished_at, params";
 const STEP_COLUMNS: &str = "job_id, phase, idx, adapter, action, adapter_dir, run, timeout_secs, status, \
      exit_code, result, error, started_at, finished_at";
 
@@ -164,6 +167,7 @@ impl Store {
         let connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(SCHEMA)?;
+        add_params_column(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -176,12 +180,23 @@ impl Store {
     }
 
     /// Stores a new running job with all its steps. Fails with `Busy` while another job is active.
-    pub fn create_job(&self, plan: &JobPlan, requested_by: &str) -> Result<i64, StoreError> {
+    pub fn create_job(
+        &self,
+        plan: &JobPlan,
+        requested_by: &str,
+        job_params: Option<&Value>,
+    ) -> Result<i64, StoreError> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
         let inserted = transaction.execute(
-            "INSERT INTO jobs (target, status, requested_by, created_at) VALUES (?1, 'running', ?2, ?3)",
-            params![plan.target, requested_by, now_unix()],
+            "INSERT INTO jobs (target, status, requested_by, created_at, params) \
+             VALUES (?1, 'running', ?2, ?3, ?4)",
+            params![
+                plan.target,
+                requested_by,
+                now_unix(),
+                job_params.map(Value::to_string)
+            ],
         );
         if let Err(rusqlite::Error::SqliteFailure(error, _)) = &inserted
             && error.code == rusqlite::ErrorCode::ConstraintViolation
@@ -335,6 +350,17 @@ impl Store {
     }
 }
 
+/// Databases from before job params get the column on open.
+fn add_params_column(connection: &Connection) -> Result<(), StoreError> {
+    let has_params = connection
+        .prepare("SELECT 1 FROM pragma_table_info('jobs') WHERE name = 'params'")?
+        .exists([])?;
+    if !has_params {
+        connection.execute_batch("ALTER TABLE jobs ADD COLUMN params TEXT")?;
+    }
+    Ok(())
+}
+
 fn insert_steps(
     transaction: &rusqlite::Transaction,
     job_id: i64,
@@ -377,6 +403,7 @@ fn parse_column<T>(
 
 fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
     let end_status: Option<String> = row.get(4)?;
+    let params_text: Option<String> = row.get(11)?;
     Ok(Job {
         id: row.get(0)?,
         target: row.get(1)?,
@@ -391,6 +418,7 @@ fn job_from_row(row: &Row) -> rusqlite::Result<Job> {
         reboot_boot_id: row.get(8)?,
         created_at: row.get(9)?,
         finished_at: row.get(10)?,
+        params: params_text.and_then(|text| serde_json::from_str(&text).ok()),
     })
 }
 
@@ -441,21 +469,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
 
-        let first = store.create_job(&plan("one"), "test").unwrap();
+        let first = store.create_job(&plan("one"), "test", None).unwrap();
         assert!(matches!(
-            store.create_job(&plan("two"), "test"),
+            store.create_job(&plan("two"), "test", None),
             Err(StoreError::Busy)
         ));
 
         store.finish_job(first, JobStatus::Succeeded, None).unwrap();
-        assert!(store.create_job(&plan("three"), "test").is_ok());
+        assert!(store.create_job(&plan("three"), "test", None).is_ok());
     }
 
     #[test]
     fn recovery_skips_pending_main_steps() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("db")).unwrap();
-        let id = store.create_job(&plan("one"), "test").unwrap();
+        let id = store.create_job(&plan("one"), "test", None).unwrap();
 
         let first = store.next_step(id, Phase::Main).unwrap().unwrap();
         let failed = StepOutcome {
@@ -488,5 +516,25 @@ mod tests {
             statuses,
             [StepStatus::Failed, StepStatus::Skipped, StepStatus::Pending]
         );
+    }
+
+    #[test]
+    fn keeps_job_params_and_upgrades_an_old_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&SCHEMA.replace(",\n    params TEXT", ""))
+            .unwrap();
+
+        let store = Store::open(&path).unwrap();
+        let params = serde_json::json!({"destination": {"name": "laptop"}});
+        let id = store
+            .create_job(&plan("one"), "test", Some(&params))
+            .unwrap();
+
+        assert_eq!(store.job(id).unwrap().params, Some(params));
+        drop(store);
+        assert!(Store::open(&path).is_ok());
     }
 }

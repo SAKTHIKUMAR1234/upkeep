@@ -37,6 +37,13 @@ impl Paths {
         self.state_dir.join("upkeep.lock")
     }
 
+    /// Root-only file with the secrets of a running job. Deleted when the job ends.
+    pub fn job_secrets(&self, job_id: i64) -> PathBuf {
+        self.state_dir
+            .join("secrets")
+            .join(format!("{job_id}.json"))
+    }
+
     pub fn adapter_state_dir(&self, adapter: &str) -> PathBuf {
         self.state_dir.join("adapters").join(adapter)
     }

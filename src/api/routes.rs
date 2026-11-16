@@ -72,7 +72,7 @@ impl IntoResponse for ApiError {
             RunError::ConfirmRequired(_) => StatusCode::PRECONDITION_REQUIRED,
             RunError::Store(StoreError::Busy) | RunError::NotActive(_) => StatusCode::CONFLICT,
             RunError::Store(StoreError::NotFound(_)) => StatusCode::NOT_FOUND,
-            RunError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            RunError::Store(_) | RunError::Secrets(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(json!({"error": self.0.to_string()}))).into_response()
     }

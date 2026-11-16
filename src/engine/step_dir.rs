@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::atomic_file;
 use crate::paths::Paths;
 use crate::store::Step;
 
@@ -17,6 +18,9 @@ pub struct StepFile {
     pub run: String,
     pub timeout_secs: u64,
     pub job_log: PathBuf,
+    /// The job's secrets file. Its values are redacted from the log and the result.
+    #[serde(default)]
+    pub secrets_file: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
 }
 
@@ -79,11 +83,11 @@ impl StepDir {
 
     pub fn prepare(&self, step: &StepFile, context: &Value) -> io::Result<()> {
         std::fs::create_dir_all(&self.path)?;
-        write_atomic(
+        atomic_file::write(
             &self.path.join("step.json"),
             &serde_json::to_vec_pretty(step)?,
         )?;
-        write_atomic(&self.context_file(), &serde_json::to_vec_pretty(context)?)
+        atomic_file::write(&self.context_file(), &serde_json::to_vec_pretty(context)?)
     }
 
     pub fn read_step(&self) -> io::Result<StepFile> {
@@ -110,7 +114,7 @@ impl StepDir {
     }
 
     pub fn write_exit(&self, record: &ExitRecord) -> io::Result<()> {
-        write_atomic(
+        atomic_file::write(
             &self.path.join("exit.json"),
             &serde_json::to_vec_pretty(record)?,
         )
@@ -170,19 +174,6 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Option<T>>
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
-}
-
-/// Writes a file so that readers see either nothing or the whole content, also after a crash.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temporary = path.with_extension("tmp");
-    let mut file = std::fs::File::create(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::secrets::Redactor;
 use crate::time::now_rfc3339;
 
 /// Appends timestamped lines to `<log-dir>/jobs/<id>/job.log`.
@@ -10,6 +11,7 @@ use crate::time::now_rfc3339;
 pub struct JobLog {
     file: Mutex<File>,
     label: String,
+    redactor: Redactor,
 }
 
 impl JobLog {
@@ -21,10 +23,22 @@ impl JobLog {
         Ok(Self {
             file: Mutex::new(file),
             label,
+            redactor: Redactor::default(),
         })
     }
 
+    /// Replaces the job's secret values in every line written after this.
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
+    }
+
+    pub fn redact<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        self.redactor.redact(text)
+    }
+
     pub fn line(&self, stream: &str, text: &str) {
+        let text = self.redactor.redact(text);
         let line = format!("{} [{}{stream}] {text}\n", now_rfc3339(), self.label);
         let mut file = self
             .file

@@ -1,10 +1,12 @@
 pub mod adapter;
 pub mod api;
+pub mod atomic_file;
 pub mod cli;
 pub mod client;
 pub mod engine;
 pub mod paths;
 pub mod plan;
+pub mod secrets;
 pub mod settings;
 pub mod store;
 pub mod time;

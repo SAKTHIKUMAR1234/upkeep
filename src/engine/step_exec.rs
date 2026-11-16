@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 use super::job_log::JobLog;
 use super::step_dir::{ExitRecord, StepDir, StepFile};
+use crate::secrets::Secrets;
 
 const KILL_GRACE: Duration = Duration::from_secs(10);
 const OUTPUT_DRAIN: Duration = Duration::from_secs(5);
@@ -34,7 +35,15 @@ pub async fn execute(path: &Path) -> anyhow::Result<()> {
 }
 
 async fn run_action(step: &StepDir, file: &StepFile) -> ExitRecord {
-    let log = match JobLog::open(&file.job_log, format!("{}:{}", file.adapter, file.action)) {
+    let secrets = match &file.secrets_file {
+        Some(path) => Secrets::load(path),
+        None => Ok(Secrets::default()),
+    };
+    let log = secrets.and_then(|secrets| {
+        let label = format!("{}:{}", file.adapter, file.action);
+        Ok(JobLog::open(&file.job_log, label)?.with_redactor(secrets.redactor()))
+    });
+    let log = match log {
         Ok(log) => Arc::new(log),
         Err(error) => return failed_to_start(error),
     };
@@ -142,7 +151,7 @@ async fn wait_or_kill(child: &mut Child, timeout: Duration) -> (std::io::Result<
     (child.wait().await, true)
 }
 
-/// Copies adapter stdout to `stdout.jsonl` and the job log; returns the last result message.
+/// Copies adapter stdout, with secrets redacted, to `stdout.jsonl` and the job log; returns the last result message.
 fn read_stdout(
     stream: impl AsyncRead + Unpin + Send + 'static,
     step: &StepDir,
@@ -157,6 +166,7 @@ fn read_stdout(
         let mut lines = BufReader::new(stream).lines();
         let mut result = None;
         while let Ok(Some(line)) = lines.next_line().await {
+            let line = log.redact(&line);
             if let Some(file) = raw.as_mut() {
                 let _ = writeln!(file, "{line}");
             }

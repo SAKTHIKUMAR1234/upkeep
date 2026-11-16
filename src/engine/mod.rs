@@ -9,12 +9,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::process::Command;
 
 use crate::adapter::Catalog;
 use crate::paths::Paths;
 use crate::plan::{JobPlan, PlanError};
+use crate::secrets::Secrets;
 use crate::settings::Settings;
 use crate::store::{Job, JobStatus, Phase, Step, StepOutcome, StepStatus, Store, StoreError};
 use job_log::JobLog;
@@ -34,6 +35,8 @@ pub enum RunError {
     Store(#[from] StoreError),
     #[error("job {0} is not active")]
     NotActive(i64),
+    #[error("cannot keep the job secrets: {0}")]
+    Secrets(std::io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +54,12 @@ pub struct RunRequest {
     #[serde(default)]
     pub confirm: bool,
     pub requested_by: Option<String>,
+    /// Non-secret values for the adapters, kept with the job.
+    #[serde(default)]
+    pub params: Option<Map<String, Value>>,
+    /// Secret values for the adapters, kept only in a root-only file until the job ends.
+    #[serde(default)]
+    pub secrets: Secrets,
 }
 
 /// Owns job execution on this server: starts jobs, drives their steps and resumes them after a restart.
@@ -96,7 +105,18 @@ impl Runner {
         }
 
         let requester = request.requested_by.as_deref().unwrap_or(default_requester);
-        let job_id = self.store.create_job(&plan, requester)?;
+        let params = request.params.map(Value::Object);
+        let job_id = self.store.create_job(&plan, requester, params.as_ref())?;
+        if !request.secrets.is_empty()
+            && let Err(error) = request.secrets.save(&self.paths.job_secrets(job_id))
+        {
+            self.store.finish_job(
+                job_id,
+                JobStatus::Failed,
+                Some("cannot keep the job secrets"),
+            )?;
+            return Err(RunError::Secrets(error));
+        }
         let steps = plan.steps.len() + plan.recovery.len();
         self.log(
             job_id,
@@ -150,6 +170,7 @@ impl Runner {
             if let Err(error) = runner.drive(job_id).await {
                 tracing::error!(job_id, %error, "job aborted");
                 runner.log(job_id, &format!("job aborted: {error}"));
+                runner.forget_secrets(job_id);
                 if let Err(error) =
                     runner
                         .store
@@ -212,9 +233,19 @@ impl Runner {
             Phase::Main => JobStatus::Succeeded,
         };
         self.store.finish_job(job.id, status, None)?;
+        self.forget_secrets(job.id);
         self.log(job.id, &format!("job finished: {}", status.as_str()));
         tracing::info!(job_id = job.id, status = status.as_str(), "job finished");
         Ok(())
+    }
+
+    fn forget_secrets(&self, job_id: i64) {
+        match std::fs::remove_file(self.paths.job_secrets(job_id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                tracing::error!(job_id, %error, "cannot delete the job secrets");
+            }
+            _ => {}
+        }
     }
 
     fn has_degraded_step(&self, job_id: i64) -> Result<bool, StoreError> {
@@ -266,6 +297,7 @@ impl Runner {
             run: step.run.clone(),
             timeout_secs: step.timeout_secs,
             job_log: self.paths.job_log(step.job_id),
+            secrets_file: Some(self.paths.job_secrets(step.job_id)),
             env,
         }
     }
@@ -287,11 +319,14 @@ impl Runner {
                 })
             })
             .collect();
+        let secrets_file = self.paths.job_secrets(job.id);
         Ok(json!({
             "job_id": job.id,
             "target": job.target,
             "host": self.host,
             "state_dir": state_dir,
+            "params": job.params.clone().unwrap_or_else(|| json!({})),
+            "secrets_file": secrets_file.exists().then_some(secrets_file),
             "step": {"phase": step.phase, "index": step.index, "adapter": step.adapter, "action": step.action},
             "previous": previous,
         }))
