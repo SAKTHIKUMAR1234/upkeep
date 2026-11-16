@@ -1,3 +1,4 @@
+title = "OS update"   # the name in the Telegram message; the plan name when absent
 confirm = true
 steps = [
   "writers:maintenance_on",

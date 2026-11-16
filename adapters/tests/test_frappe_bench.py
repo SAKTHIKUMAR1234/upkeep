@@ -40,6 +40,42 @@ def show_config(site: str, maintenance_mode: int) -> str:
     return json.dumps({site: {"db_name": "x", "maintenance_mode": maintenance_mode}})
 
 
+class SummaryTest(unittest.TestCase):
+    def test_check_summary_lists_apps_behind_errors_and_skipped(self):
+        apps = [{"app": "frappe", "behind": 830}, {"app": "hrms", "behind": 0}, {"app": "erpnext", "behind": 3693}]
+        self.assertEqual(
+            frappe_bench.check_summary(apps, [{"app": "x"}], ["a", "b"]),
+            ["frappe 830 behind, erpnext 3693 behind", "1 app could not be checked", "2 apps skipped"],
+        )
+        self.assertEqual(frappe_bench.check_summary(apps[1:2], [], []), ["all apps up to date"])
+
+    def test_maintenance_off_summary(self):
+        self.assertEqual(
+            frappe_bench.maintenance_off_summary(["a.local"], ["a.local", "b.local"]),
+            ["maintenance off: a.local, b.local", "scheduler on: a.local"],
+        )
+        self.assertEqual(frappe_bench.maintenance_off_summary([], []), ["nothing to change"])
+
+    def test_verify_names_each_site(self):
+        context = Context(data={}, adapter_dir=Path("."), config={**CONFIG, "verify_wait": 0})
+        shell = FakeShell({("execute", "frappe.ping"): '"pong"'})
+        output = io.StringIO()
+        with mock.patch.object(frappe_bench, "run", shell), contextlib.redirect_stdout(output):
+            frappe_bench.verify(context)
+        self.assertIn('"summary": ["site a.local answers", "site b.local answers"]', output.getvalue())
+
+        down = FakeShell({("execute", "frappe.ping"): "Traceback\nself.connect()"})
+        with (
+            mock.patch.object(frappe_bench, "run", down),
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(AdapterError) as raised,
+        ):
+            frappe_bench.verify(context)
+        self.assertEqual(
+            raised.exception.plain, "not working: site a.local does not answer, site b.local does not answer"
+        )
+
+
 class ParseTest(unittest.TestCase):
     def test_backup_summary_paths_are_absolute(self):
         files = frappe_bench.parse_backup_summary(
@@ -220,6 +256,37 @@ class UpdateTest(unittest.TestCase):
 
         pulled = [command[command.index("-C") + 1] for command in shell.commands if "pull" in command]
         self.assertEqual(pulled, ["/benches/main/apps/frappe", "/benches/main/apps/hrms"])
+
+    def test_a_failed_build_names_the_part_that_failed(self):
+        self.write_state({"databases": {"a.local": "a.sql.gz"}})
+        build_failed = CommandError(["runuser", "pilot", "build"], 1, "esbuild\nno internet in the container\n")
+        shell = FakeShell({("list-apps",): "frappe\n", ("--yes", "build"): build_failed})
+        with self.assertRaises(CommandError) as raised:
+            self.run_action(frappe_bench.update, shell, self.context())
+        self.assertEqual(raised.exception.plain, "building the website files: no internet in the container")
+
+    def test_update_summary_names_changed_apps(self):
+        pulled = [
+            {"app": "frappe", "before": "9f8ae9c1234", "after": "2e9ecdc5678"},
+            {"app": "hrms", "before": "6091df8", "after": "6091df8"},
+        ]
+        self.assertEqual(
+            frappe_bench.update_summary(pulled, ["private_app"]),
+            ["frappe 9f8ae9c → 2e9ecdc", "1 app skipped", "database updated", "website files built"],
+        )
+        self.assertEqual(frappe_bench.update_summary(pulled[1:], [])[0], "no app changed")
+
+    def test_rollback_summary_names_commits_and_backup_time(self):
+        apps = {"frappe": "9f8ae9c1234", "hrms": "6091df8aaaa"}
+        database = "./a.local/private/backups/20261117_001800-a_local-database.sql.gz"
+        self.assertEqual(
+            frappe_bench.rollback_summary(apps, {"a.local": database}),
+            ["code back to frappe 9f8ae9c, hrms 6091df8", "database restored from the 00:18 backup"],
+        )
+        self.assertEqual(
+            frappe_bench.rollback_summary({}, {"a.local": "x.sql.gz", "b.local": "y.sql.gz"}),
+            ["database of a.local restored from the backup", "database of b.local restored from the backup"],
+        )
 
     def test_rollback_resets_apps_and_restores_the_backup(self):
         password_file = self.state_dir / "root-password"

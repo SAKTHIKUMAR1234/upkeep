@@ -1,3 +1,4 @@
+title = "Bench update"
 confirm = true
 steps = [
   "hr-dev:check_updates",

@@ -1,5 +1,6 @@
 pub mod digest;
 pub mod job;
+pub mod titles;
 pub mod wording;
 
 use super::checks::{Level, Observation};

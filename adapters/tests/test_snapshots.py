@@ -153,6 +153,19 @@ class BackupOutputTest(unittest.TestCase):
         self.assertEqual(snapshots.snapshot_tags(12, "os-update"), ["upkeep", "job=12", "plan=os-update"])
 
 
+class SummaryTest(unittest.TestCase):
+    def test_sizes_read_as_words(self):
+        sizes = [0, 999, 4_200_000, 113_400_000_000, 43_000_000_000_000]
+        self.assertEqual(
+            [snapshots.size_text(size) for size in sizes], ["0 bytes", "999 bytes", "4.2 MB", "113 GB", "43 TB"]
+        )
+
+    def test_snapshot_summary_shows_read_and_stored_sizes(self):
+        summary = {"total_bytes_processed": 113_000_000_000, "data_added_packed": 43_000_000_000}
+        self.assertEqual(snapshots.snapshot_summary(summary, 0), ["113 GB read, 43 GB stored"])
+        self.assertEqual(snapshots.snapshot_summary(summary, 2)[1], "2 files could not be read")
+
+
 class RetentionTest(unittest.TestCase):
     def test_forget_groups_by_host_and_keeps_the_policy(self):
         args = snapshots.forget_args("vm-a", {"daily": 7, "weekly": 4, "monthly": 12})

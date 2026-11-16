@@ -4,6 +4,24 @@ Python 3 adapters that use only the standard library. Install this folder as `/u
 
 Run the tests with `cd adapters && python3 -m unittest`.
 
+## Job messages
+
+Each plan job gets one Telegram message. Upkeep sends it when the job starts and edits it as the steps run and when the job ends. The message uses plain names, never `adapter:action`:
+
+| Where | Key | Example | Meaning |
+|---|---|---|---|
+| Plan file | `title` | `title = "OS update"` | Name in the header, such as "OS UPDATE DONE". The plan name when absent. |
+| `adapter.toml` | `display_name` | `display_name = "HR staging"` | Added to a step name when two adapters run a step with the same name. |
+| `adapter.toml` | `[actions.<name>] title` | `title = "Taking snapshot"` | Step name. When absent, a built-in name (for example "Install updates" for `update`) or the action name in words. |
+
+An action's `result` line can give these optional fields, with `result(summary=[...], state="...")` from `upkeep_adapter.py`:
+
+| Field | Example | Meaning |
+|---|---|---|
+| `summary` | `["51 packages updated", "kernel 7.0.0-43"]` | Short plain lines shown after the step name. |
+| `state` | `"The site runs the old version, as before the update."` | The state after a failed job, shown after the recovery steps. |
+| `error` | `"building the website files: no internet"` | The plain failure reason. `main` sets it from the `AdapterError`: its `plain` text, or for a `CommandError` the last output line, never the command. `failing_as("building the website files")` puts the failed part in front. |
+
 ## ubuntu-os
 
 Actions: `check_updates`, `update` (exit 10 when a reboot is required: `/run/reboot-required` exists or a `linux-image-*` package was upgraded, because Debian sets the flag only with unattended-upgrades), `verify`, `discover`, `snapshot`, `retention`, `restore`.

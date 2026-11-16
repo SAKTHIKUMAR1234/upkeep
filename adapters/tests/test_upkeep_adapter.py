@@ -120,11 +120,35 @@ class MainTest(unittest.TestCase):
 
         code, lines = self.run_main("fail", actions)
         self.assertEqual(code, 1)
-        self.assertEqual(lines[-1], {"type": "log", "level": "error", "message": "backup failed"})
+        self.assertEqual(
+            lines[-2:],
+            [
+                {"type": "log", "level": "error", "message": "backup failed"},
+                {"type": "result", "error": "backup failed"},
+            ],
+        )
 
         code, lines = self.run_main("nope", actions)
         self.assertEqual(code, 2)
         self.assertIn("unknown action 'nope'", lines[0]["message"])
+
+
+class PlainReasonTest(unittest.TestCase):
+    def test_a_command_error_gives_its_last_line_not_the_command(self):
+        error = CommandError(["runuser", "-u", "frappe", "git", "pull"], 1, "fetching\nPermission denied (publickey)\n")
+        self.assertIn("runuser -u frappe git pull exited with 1", str(error))
+        self.assertEqual(error.plain, "Permission denied (publickey)")
+        self.assertEqual(CommandError(["false"], 3, "").plain, "a command exited with 3")
+
+    def test_failing_as_names_the_part_that_failed(self):
+        with self.assertRaises(CommandError) as raised, upkeep_adapter.failing_as("building the website files"):
+            raise CommandError(["pilot", "build"], 1, "no internet")
+        self.assertEqual(raised.exception.plain, "building the website files: no internet")
+
+    def test_verify_failed_names_each_problem(self):
+        error = upkeep_adapter.verify_failed(["service web: inactive", "failed unit x.service"])
+        self.assertEqual(str(error), "verify failed: service web: inactive; failed unit x.service")
+        self.assertEqual(error.plain, "not working: service web, failed unit x.service")
 
 
 class DurationTest(unittest.TestCase):

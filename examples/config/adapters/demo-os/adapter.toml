@@ -1,10 +1,12 @@
 name = "demo-os"
 run = "sh adapter.sh"
+display_name = "Demo server"   # the name in messages when two adapters run the same step
 writes_data = false
 
 [actions.snapshot]
 timeout = "5m"
 [actions.upload]
+title = "Uploading the snapshot"   # the step name in messages
 timeout = "30m"
 needs = ["snapshot"]
 [actions.update]

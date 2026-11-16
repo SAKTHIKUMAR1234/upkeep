@@ -10,7 +10,8 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
@@ -29,15 +30,44 @@ VERIFY_RETRY_INTERVAL = 15
 
 
 class AdapterError(Exception):
-    """A failure the adapter reports as its final error line before exiting with EXIT_FAILED."""
+    """A failure the adapter logs before exiting with EXIT_FAILED.
+
+    `plain` is the short reason the Telegram job message shows; it defaults to the message.
+    """
+
+    def __init__(self, message: str, plain: str | None = None):
+        super().__init__(message)
+        self.plain = plain or message
 
 
 class CommandError(AdapterError):
+    """A command that failed. Its plain reason is the last output line, never the command."""
+
     def __init__(self, command: list[str], code: int, output: str):
-        last_lines = "\n".join(output.strip().splitlines()[-5:])
-        super().__init__(f"{' '.join(command)} exited with {code}" + (f": {last_lines}" if last_lines else ""))
+        lines = output.strip().splitlines()
+        last_lines = "\n".join(lines[-5:])
+        super().__init__(
+            f"{' '.join(command)} exited with {code}" + (f": {last_lines}" if last_lines else ""),
+            plain=lines[-1].strip() if lines else f"a command exited with {code}",
+        )
         self.code = code
         self.output = output
+
+
+@contextmanager
+def failing_as(what: str) -> Iterator[None]:
+    """Puts `what`, such as "building the website files", in front of the plain reason of a failure inside."""
+    try:
+        yield
+    except AdapterError as error:
+        error.plain = f"{what}: {error.plain}"
+        raise
+
+
+def verify_failed(problems: list[str]) -> AdapterError:
+    """The error of a failed verify. The plain reason names each problem up to its first colon."""
+    names = [problem.split(":")[0] for problem in problems]
+    return AdapterError(f"verify failed: {'; '.join(problems)}", plain=f"not working: {', '.join(names)}")
 
 
 @dataclass
@@ -83,6 +113,12 @@ def progress(percent: int, message: str) -> None:
 
 
 def result(**fields) -> None:
+    """The action's result. The Telegram job message reads these optional fields:
+
+    - `summary`: short plain lines, such as ["51 packages updated", "kernel 7.0.0-43"].
+    - `state`: one plain sentence about the state after a failure, such as "The site runs the old version".
+    - `error`: the plain failure reason; `main` sets it from the AdapterError.
+    """
     emit("result", **fields)
 
 
@@ -158,6 +194,7 @@ def main(actions: dict[str, Callable[[Context], int | None]], adapter_dir: Path 
         code = handler(context) or EXIT_OK
     except AdapterError as error:
         log(str(error), level="error")
+        result(error=error.plain)
         code = EXIT_FAILED
     sys.exit(code)
 
@@ -221,6 +258,11 @@ def check_ping(ping: dict, cwd: Path) -> str | None:
 
     code, output = run_check(["sh", "-c", ping["command"]], timeout, cwd)
     return None if code == 0 else output.strip() or f"exit code {code}"
+
+
+def count(number: int, noun: str) -> str:
+    """For example "1 package" or "3 packages"."""
+    return f"{number} {noun}{'' if number == 1 else 's'}"
 
 
 def run_check(command: list[str], timeout: float, cwd: Path | None = None) -> tuple[int, str]:

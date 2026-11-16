@@ -17,21 +17,28 @@ use tokio::sync::Notify;
 use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::adapter::health;
+use crate::engine::step_dir::StepDir;
 use crate::engine::{JobEvent, Runner};
 use crate::plan;
 use crate::settings::Settings;
-use crate::store::StoreError;
+use crate::store::{Job, Step, StepStatus, StoreError};
 use crate::time::now_unix;
 use checks::host::{self, SecurityUpdates};
 use checks::{Observation, system};
 use db::MonitorDb;
 use message::digest::{HostReport, Section};
+use message::job::JobView;
+use message::titles::Titles;
 use message::{Event, Letterhead};
 use settings::MonitorSettings;
 use state::{CheckState, Hold, Policy};
 use telegram::Telegram;
 
 const DELIVERY_TICK: Duration = Duration::from_secs(5);
+/// How often the running job's progress is looked at.
+const PROGRESS_TICK: Duration = Duration::from_secs(10);
+/// Seconds between two progress edits of a job message. A new step or the end is sent at once.
+const PROGRESS_EVERY: i64 = 30;
 const DIGEST_DAY: &str = "digest_day";
 
 #[derive(Debug, thiserror::Error)]
@@ -154,46 +161,81 @@ impl Monitor {
         }
     }
 
+    /// Keeps one Telegram message per plan job up to date: on each job event, and for progress every `PROGRESS_TICK`.
     async fn announce_jobs(self: Arc<Self>, mut events: broadcast::Receiver<JobEvent>) {
+        let mut progress = tokio::time::interval(PROGRESS_TICK);
+        let mut last: Option<Queued> = None;
         loop {
-            match events.recv().await {
-                Ok(event) => {
-                    if let Err(error) = self.announce_job(event) {
-                        tracing::error!(%error, "cannot queue the job message");
+            let job_id = tokio::select! {
+                event = events.recv() => match event {
+                    Ok(event) => Some(event.job_id()),
+                    Err(RecvError::Lagged(missed)) => {
+                        tracing::warn!(missed, "job events skipped");
+                        None
                     }
-                }
-                Err(RecvError::Lagged(missed)) => tracing::warn!(missed, "job messages skipped"),
-                Err(RecvError::Closed) => return,
+                    Err(RecvError::Closed) => return,
+                },
+                _ = progress.tick() => match self.runner.store().active_job() {
+                    Ok(job) => job.map(|job| job.id),
+                    Err(error) => {
+                        tracing::error!(%error, "cannot read the active job");
+                        None
+                    }
+                },
+            };
+            if let Some(job_id) = job_id
+                && let Err(error) = self.announce_job(job_id, &mut last)
+            {
+                tracing::error!(%error, "cannot queue the job message");
             }
         }
     }
 
-    /// Queues the start or end message of a plan's job.
-    fn announce_job(&self, event: JobEvent) -> Result<(), MonitorError> {
+    /// Queues the current text of a plan job's message when it is due and changed.
+    fn announce_job(&self, job_id: i64, last: &mut Option<Queued>) -> Result<(), MonitorError> {
         let active = self.active();
         if active.telegram.is_none() {
             return Ok(());
         }
-        let (job_id, started) = match event {
-            JobEvent::Started(job_id) => (job_id, true),
-            JobEvent::Finished(job_id) => (job_id, false),
-        };
         let store = self.runner.store();
         let job = store.job(job_id)?;
         if !plan::notifies(&job.target, &self.runner.paths().plans_dir()) {
             return Ok(());
         }
         let steps = store.steps(job_id)?;
-        let letterhead = self.letterhead(&active.settings);
         let now = now_unix();
-        let text = if started {
-            letterhead.job_started(&job, &steps, active.settings.job_grace)
-        } else {
-            letterhead.job_finished(&job, &steps, now)
-        };
-        self.db.enqueue(&text, now)?;
-        self.outbox_changed.notify_one();
+        let queued = Queued::new(&job, &steps, now);
+        if !queued.is_due(last.as_ref()) {
+            return Ok(());
+        }
+        *last = Some(queued);
+
+        let text = self.job_text(&active.settings, &job, &steps, now);
+        if self.db.job_text(job_id)?.as_deref() != Some(text.as_str()) {
+            self.db.queue_job_text(job_id, &text, now)?;
+            self.outbox_changed.notify_one();
+        }
         Ok(())
+    }
+
+    fn job_text(&self, settings: &MonitorSettings, job: &Job, steps: &[Step], now: i64) -> String {
+        let paths = self.runner.paths();
+        let titles = Titles::load(&job.target, &self.runner.catalog(), &paths.plans_dir());
+        let running = steps.iter().find(|step| step.status == StepStatus::Running);
+        let progress = running.and_then(|step| {
+            StepDir::for_step(paths, step)
+                .last_progress()
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "cannot read the step progress");
+                    None
+                })
+        });
+        let view = JobView {
+            titles: &titles,
+            progress: progress.as_ref(),
+            alerts_held: settings.enabled,
+        };
+        self.letterhead(settings).job_message(job, steps, view, now)
     }
 
     /// One round: observe, move each check's state, save it and queue the messages it asks for.
@@ -350,7 +392,8 @@ impl Monitor {
         let active = self.active();
         let telegram = active.telegram.as_ref().ok_or(MonitorError::NoTelegram)?;
         let text = self.letterhead(&active.settings).test();
-        Ok(telegram.send(&text).await?)
+        telegram.send(&text).await?;
+        Ok(())
     }
 
     /// The `GET /monitor` body: every check with its state.
@@ -367,6 +410,39 @@ impl Monitor {
             "outbox": self.db.outbox_len()?,
             "checks": checks,
         }))
+    }
+}
+
+/// The last job message text queued: which job, its step states and when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Queued {
+    job_id: i64,
+    states: String,
+    at: i64,
+}
+
+impl Queued {
+    fn new(job: &Job, steps: &[Step], at: i64) -> Self {
+        let mut states = job.status.as_str().to_owned();
+        for step in steps {
+            states.push(' ');
+            states.push_str(step.status.as_str());
+        }
+        Self {
+            job_id: job.id,
+            states,
+            at,
+        }
+    }
+
+    /// A new job, a new step or the end is due at once; progress at most every `PROGRESS_EVERY`.
+    fn is_due(&self, last: Option<&Queued>) -> bool {
+        match last {
+            Some(last) if last.job_id == self.job_id && last.states == self.states => {
+                self.at - last.at >= PROGRESS_EVERY
+            }
+            _ => true,
+        }
     }
 }
 
@@ -420,6 +496,22 @@ async fn when<T>(enabled: bool, check: impl Future<Output = T>) -> Option<T> {
 mod tests {
     use super::*;
     use checks::Level;
+
+    #[test]
+    fn step_changes_are_due_at_once_and_progress_every_30_seconds() {
+        let queued = |job_id, states: &str, at| Queued {
+            job_id,
+            states: states.into(),
+            at,
+        };
+        let last = queued(1, "running ok running", 100);
+        assert!(queued(1, "running ok running", 100).is_due(None));
+        assert!(!queued(1, "running ok running", 129).is_due(Some(&last)));
+        assert!(queued(1, "running ok running", 130).is_due(Some(&last)));
+        assert!(queued(1, "running ok ok", 101).is_due(Some(&last)));
+        assert!(queued(1, "succeeded ok ok", 101).is_due(Some(&last)));
+        assert!(queued(2, "running ok running", 101).is_due(Some(&last)));
+    }
 
     #[test]
     fn a_job_holds_own_checks_but_not_peers() {

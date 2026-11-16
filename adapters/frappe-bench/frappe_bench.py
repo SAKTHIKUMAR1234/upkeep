@@ -18,11 +18,14 @@ from upkeep_adapter import (
     CommandError,
     Context,
     check_manifest_health,
+    count,
+    failing_as,
     log,
     main,
     parse_duration,
     result,
     run,
+    verify_failed,
     wait_until_healthy,
 )
 
@@ -30,6 +33,8 @@ SITE_STATE_FILE = "site_state.json"
 UPDATE_STATE_FILE = "update_state.json"
 JOB_WAIT_INTERVAL = 5
 BACKUP_LINE = re.compile(r"^(Config|Database|Public|Private)\s*:\s*(\S+)")
+BACKUP_TIME = re.compile(r"(?:^|/)\d{8}_(\d{2})(\d{2})\d{2}-[^/]*$")
+SHORT_COMMIT = 7
 
 
 class Bench:
@@ -58,11 +63,11 @@ class Bench:
     def git(self, app: str, *args: str, quiet: bool = False) -> str:
         return run(self.user_prefix + ["git", "-C", str(self.directory / "apps" / app), *args], quiet=quiet)
 
-    @property
-    def apps(self) -> list[str]:
-        """The bench's apps without `skip_apps`, which check_updates and update leave alone."""
-        skipped = set(self.config.get("skip_apps", []))
-        return [app for app in self.pilot("list-apps", quiet=True).split() if app not in skipped]
+    def list_apps(self) -> tuple[list[str], list[str]]:
+        """The bench's apps to update, and the ones in `skip_apps` that check_updates and update leave alone."""
+        skip = set(self.config.get("skip_apps", []))
+        apps = self.pilot("list-apps", quiet=True).split()
+        return [app for app in apps if app not in skip], [app for app in apps if app in skip]
 
 
 def user_prefix(user: str | None) -> list[str]:
@@ -137,7 +142,7 @@ def maintenance_on(context: Context) -> None:
             bench.frappe(site, "scheduler", "disable")
 
     wait_for_jobs(bench, parse_duration(context.config.get("job_wait_timeout"), default=600))
-    result(before=state)
+    result(before=state, summary=[f"maintenance on: {', '.join(bench.sites)}", "no background jobs running"])
 
 
 def maintenance_off(context: Context) -> None:
@@ -157,7 +162,17 @@ def maintenance_off(context: Context) -> None:
             bench.frappe(site, "set-maintenance-mode", "off")
             maintenance_off_sites.append(site)
     state_file.unlink(missing_ok=True)
-    result(scheduler_enabled=scheduler_enabled, maintenance_off=maintenance_off_sites)
+    result(
+        scheduler_enabled=scheduler_enabled,
+        maintenance_off=maintenance_off_sites,
+        summary=maintenance_off_summary(scheduler_enabled, maintenance_off_sites),
+    )
+
+
+def maintenance_off_summary(scheduler_enabled: list[str], maintenance_off_sites: list[str]) -> list[str]:
+    lines = [f"maintenance off: {', '.join(maintenance_off_sites)}"] if maintenance_off_sites else []
+    lines += [f"scheduler on: {', '.join(scheduler_enabled)}"] if scheduler_enabled else []
+    return lines or ["nothing to change"]
 
 
 def parse_backup_summary(output: str, sites_dir: Path) -> dict[str, str]:
@@ -187,7 +202,7 @@ def backup(context: Context) -> None:
     # A new backup starts a new update: rollback returns to this point.
     databases = {site: os.path.relpath(files["database"], sites_dir) for site, files in backups.items()}
     write_site_state(context.state_dir / UPDATE_STATE_FILE, {"databases": databases})
-    result(backups=backups)
+    result(backups=backups, summary=[f"backup of {site} saved" for site in backups])
 
 
 def parse_upstream(line: str) -> tuple[str, str, str] | None:
@@ -228,8 +243,9 @@ def app_status(bench: Bench, app: str) -> dict:
 
 def check_updates(context: Context) -> int | None:
     bench = Bench(context.config)
+    names, skipped = bench.list_apps()
     apps, errors = [], []
-    for app in bench.apps:
+    for app in names:
         try:
             status = app_status(bench, app)
         except AdapterError as error:
@@ -240,8 +256,19 @@ def check_updates(context: Context) -> int | None:
         apps.append(status)
 
     behind = [status["app"] for status in apps if status["behind"]]
-    result(apps=apps, errors=errors, behind=behind)
+    result(apps=apps, errors=errors, behind=behind, summary=check_summary(apps, errors, skipped))
     return EXIT_DEGRADED if errors else None
+
+
+def check_summary(apps: list[dict], errors: list[dict], skipped: list[str]) -> list[str]:
+    """For example ["frappe 830 behind, erpnext 3693 behind", "7 apps skipped"]."""
+    behind = [f"{status['app']} {status['behind']} behind" for status in apps if status["behind"]]
+    lines = [", ".join(behind) if behind else "all apps up to date"]
+    if errors:
+        lines.append(f"{count(len(errors), 'app')} could not be checked")
+    if skipped:
+        lines.append(f"{count(len(skipped), 'app')} skipped")
+    return lines
 
 
 def update(context: Context) -> None:
@@ -250,26 +277,42 @@ def update(context: Context) -> None:
     state = read_site_state(state_file)
     if "databases" not in state:
         raise AdapterError("no backup from this update: run backup first")
+    apps, skipped = bench.list_apps()
     if "apps" not in state:
-        state["apps"] = {app: bench.git(app, "rev-parse", "HEAD", quiet=True).strip() for app in bench.apps}
+        state["apps"] = {app: bench.git(app, "rev-parse", "HEAD", quiet=True).strip() for app in apps}
         write_site_state(state_file, state)
 
     pulled = []
-    for app in bench.apps:
+    for app in apps:
         before = bench.git(app, "rev-parse", "HEAD", quiet=True).strip()
-        bench.git(app, "pull", "--ff-only")
+        with failing_as(f"getting the new code of {app}"):
+            bench.git(app, "pull", "--ff-only")
         after = bench.git(app, "rev-parse", "HEAD", quiet=True).strip()
         pulled.append({"app": app, "before": before, "after": after})
 
     for site in bench.sites:
-        bench.frappe(site, "migrate")
+        with failing_as(f"updating the database of {site}"):
+            bench.frappe(site, "migrate")
     state["built"] = True
     write_site_state(state_file, state)
-    bench.pilot("build")
+    with failing_as("building the website files"):
+        bench.pilot("build")
     restart = context.config.get("restart", True)
     if restart:
-        bench.pilot("restart")
-    result(apps=pulled, migrated=bench.sites, restarted=restart)
+        with failing_as("restarting the bench"):
+            bench.pilot("restart")
+    result(apps=pulled, migrated=bench.sites, restarted=restart, summary=update_summary(pulled, skipped))
+
+
+def update_summary(pulled: list[dict], skipped: list[str]) -> list[str]:
+    """For example ["frappe 9f8ae9c → 2e9ecdc", "7 apps skipped", "database updated", "website files built"]."""
+    changed = [app for app in pulled if app["before"] != app["after"]]
+    lines = [f"{app['app']} {app['before'][:SHORT_COMMIT]} → {app['after'][:SHORT_COMMIT]}" for app in changed]
+    if not changed:
+        lines.append("no app changed")
+    if skipped:
+        lines.append(f"{count(len(skipped), 'app')} skipped")
+    return lines + ["database updated", "website files built"]
 
 
 def rollback(context: Context) -> None:
@@ -279,6 +322,7 @@ def rollback(context: Context) -> None:
     state = read_site_state(state_file)
     if "apps" not in state:
         log("update did not start: nothing to roll back")
+        result(summary=["nothing to roll back: the update did not start"])
         return
 
     for app, commit in state["apps"].items():
@@ -290,7 +334,24 @@ def rollback(context: Context) -> None:
     if context.config.get("restart", True):
         bench.pilot("restart")
     state_file.unlink()
-    result(apps=state["apps"], restored=state["databases"])
+    result(
+        apps=state["apps"],
+        restored=state["databases"],
+        summary=rollback_summary(state["apps"], state["databases"]),
+        state="The site runs the old version, as before the update.",
+    )
+
+
+def rollback_summary(apps: dict[str, str], databases: dict[str, str]) -> list[str]:
+    """For example ["code back to frappe 9f8ae9c, hrms 6091df8", "database restored from the 00:18 backup"]."""
+    commits = ", ".join(f"{app} {commit[:SHORT_COMMIT]}" for app, commit in apps.items())
+    lines = [f"code back to {commits}"] if commits else []
+    for site, database in databases.items():
+        match = BACKUP_TIME.search(database)
+        backup = f"the {match.group(1)}:{match.group(2)} backup" if match else "the backup"
+        database_name = f"database of {site}" if len(databases) > 1 else "database"
+        lines.append(f"{database_name} restored from {backup}")
+    return lines
 
 
 def restore_database(bench: Bench, options: dict, site: str, database: str) -> None:
@@ -322,7 +383,8 @@ def verify(context: Context) -> None:
     bench = Bench(context.config)
     problems = wait_until_healthy(context, lambda: check_health(context, bench))
     if problems:
-        raise AdapterError(f"verify failed: {'; '.join(problems)}")
+        raise verify_failed(problems)
+    result(summary=[f"site {site} answers" for site in bench.sites])
 
 
 def check_health(context: Context, bench: Bench) -> list[str]:
@@ -335,7 +397,7 @@ def check_health(context: Context, bench: Bench) -> list[str]:
         if '"pong"' in answer:
             log(f"{site}: ping ok")
         else:
-            problems.append(f"{site}: frappe.ping failed: {answer.strip()[-300:]}")
+            problems.append(f"site {site} does not answer: frappe.ping failed: {answer.strip()[-300:]}")
             log(problems[-1], level="error")
     return problems
 

@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from upkeep_adapter import EXIT_DEGRADED, AdapterError, CommandError, Context, log, progress, result
+from upkeep_adapter import EXIT_DEGRADED, AdapterError, CommandError, Context, count, log, progress, result
 
 DEFAULT_ENGINE = "/usr/local/lib/upkeep/bin/restic"
 DEFAULT_CACHE_DIR = "/var/cache/upkeep/restic"
@@ -306,6 +306,25 @@ def summary_result(summary: dict) -> dict:
     return {key: summary.get(key) for key in keys}
 
 
+def size_text(size: int | None) -> str:
+    """A byte count in words, such as "113 GB" or "4.2 MB"."""
+    units = ["bytes", "KB", "MB", "GB", "TB"]
+    value, unit = float(size or 0), 0
+    while value >= 1000 and unit < len(units) - 1:
+        value, unit = value / 1000, unit + 1
+    precision = 1 if unit and value < 10 else 0
+    return f"{value:.{precision}f} {units[unit]}"
+
+
+def snapshot_summary(summary: dict, unreadable: int) -> list[str]:
+    """For example ["113 GB read, 43 GB stored"]."""
+    read = size_text(summary.get("total_bytes_processed"))
+    lines = [f"{read} read, {size_text(summary.get('data_added_packed'))} stored"]
+    if unreadable:
+        lines.append(f"{count(unreadable, 'file')} could not be read")
+    return lines
+
+
 def snapshot(context: Context) -> int | None:
     config = SnapshotConfig.from_config(context.config)
     destination = Destination.from_params(context.params)
@@ -331,7 +350,13 @@ def snapshot(context: Context) -> int | None:
     if messages.summary is None:
         raise AdapterError(f"restic backup failed with exit code {code} and saved no snapshot")
     summary = summary_result(messages.summary)
-    result(**summary, host=host, paths=paths, unreadable_files=messages.errors)
+    result(
+        **summary,
+        host=host,
+        paths=paths,
+        unreadable_files=messages.errors,
+        summary=snapshot_summary(summary, messages.errors),
+    )
     log(f"snapshot {summary['snapshot_id'][:8]} saved: {summary['data_added_packed']} bytes sent")
     if code == EXIT_INCOMPLETE_SNAPSHOT:
         log(f"{messages.errors} files could not be read; the snapshot is incomplete", level="warn")
@@ -382,7 +407,7 @@ def retention(context: Context) -> None:
         completed = run_engine(repository, *forget_args(host, config.retention))
     outcome = parse_forget(completed.stdout)
     log(f"kept {outcome['kept']} snapshots, removed {outcome['removed']}")
-    result(**outcome, policy=config.retention)
+    result(**outcome, policy=config.retention, summary=[f"kept {outcome['kept']}, removed {outcome['removed']}"])
 
 
 def restore_args(snapshot_id: str, target: str, path: str | None) -> list[str]:
@@ -405,4 +430,10 @@ def restore(context: Context) -> None:
         completed = run_engine(repository, *args)
     for line in completed.stdout.splitlines()[-3:]:
         log(line)
-    result(snapshot=snapshot_id, target=params["target"], path=params.get("path"))
+    restored = params.get("path") or "everything"
+    result(
+        snapshot=snapshot_id,
+        target=params["target"],
+        path=params.get("path"),
+        summary=[f"{restored} from snapshot {snapshot_id} restored into {params['target']}"],
+    )

@@ -16,10 +16,12 @@ const BOT_TOKEN: &str = "4242:test-bot-token";
 const QUIET_KINDS: &str =
     r#""inodes", "memory", "swap", "load", "failed-units", "reboot-required", "security-updates""#;
 
-/// A local stand-in for the Telegram Bot API that records each message text.
+/// A local stand-in for the Telegram Bot API. It keeps each message's current text:
+/// message ids start at 1, and an edit replaces the text of its message.
 #[derive(Clone, Default)]
 struct FakeBot {
     texts: Arc<Mutex<Vec<String>>>,
+    edits: Arc<Mutex<usize>>,
     down: Arc<Mutex<bool>>,
 }
 
@@ -28,7 +30,7 @@ impl FakeBot {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let app = axum::Router::new()
-            .route("/{bot}/sendMessage", post(send_message))
+            .route("/{bot}/{method}", post(bot_method))
             .with_state(self.clone());
         tokio::spawn(async move { axum::serve(listener, app).await });
         format!("http://{address}")
@@ -54,9 +56,9 @@ impl FakeBot {
     }
 }
 
-async fn send_message(
+async fn bot_method(
     State(bot): State<FakeBot>,
-    UrlPath(bot_path): UrlPath<String>,
+    UrlPath((bot_path, method)): UrlPath<(String, String)>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     if *bot.down.lock().unwrap() {
@@ -66,11 +68,22 @@ async fn send_message(
     }
     assert_eq!(bot_path, format!("bot{BOT_TOKEN}"));
     assert_eq!(body["chat_id"], "-1001");
-    assert_eq!(body["message_thread_id"], 7);
     assert_eq!(body["parse_mode"], "HTML");
     let text = body["text"].as_str().unwrap().to_owned();
-    bot.texts.lock().unwrap().push(text);
-    (StatusCode::OK, Json(json!({"ok": true, "result": {}})))
+    let mut texts = bot.texts.lock().unwrap();
+    if method == "editMessageText" {
+        let message_id = body["message_id"].as_u64().unwrap() as usize;
+        texts[message_id - 1] = text;
+        *bot.edits.lock().unwrap() += 1;
+        return (StatusCode::OK, Json(json!({"ok": true, "result": {}})));
+    }
+    assert_eq!(method, "sendMessage");
+    assert_eq!(body["message_thread_id"], 7);
+    texts.push(text);
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "result": {"message_id": texts.len()}})),
+    )
 }
 
 fn write_private(path: &Path, text: &str) {
@@ -349,7 +362,7 @@ async fn alert_test_and_status_all_from_the_cli() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn plan_jobs_announce_their_start_and_end() {
+async fn a_plan_job_gets_one_message_edited_until_it_ends() {
     let bot = FakeBot::default();
     let api_url = bot.start().await;
     let mut harness = Harness::new();
@@ -357,57 +370,50 @@ async fn plan_jobs_announce_their_start_and_end() {
     harness.write_settings(&monitor_settings(&harness, &api_url, monitor, ""));
     harness.add_adapter(
         "quick",
-        "[actions.first]\n[actions.second]\n[actions.broken]\n[actions.cleanup]\n",
-        "[ \"$1\" != broken ]\n",
+        "[actions.first]\ntitle = \"First step\"\n[actions.second]\n[actions.broken]\n[actions.rollback]\n",
+        "[ \"$1\" != broken ]\nif [ \"$1\" = second ]; then sleep 1; echo '{\"type\":\"result\",\"summary\":[\"2 things done\"]}'; fi\n",
     );
-    harness.add_plan("good", "steps = [\"quick:first\", \"quick:second\"]\n");
+    harness.add_plan(
+        "good",
+        "title = \"Good run\"\nsteps = [\"quick:first\", \"quick:second\"]\n",
+    );
     harness.add_plan(
         "bad",
-        "steps = [\"quick:first\", \"quick:broken\", \"quick:second\"]\non_failure = [\"quick:cleanup\"]\n",
+        "steps = [\"quick:first\", \"quick:broken\", \"quick:second\"]\non_failure = [\"quick:rollback\"]\n",
     );
     harness.add_plan("quiet", "steps = [\"quick:first\"]\nnotify = false\n");
     harness.start().await;
 
     let id = harness.run("good", false).await.unwrap();
     harness.wait_for_status(id, "succeeded").await;
-    let started = bot
+    let done = bot
         .expect(
             &harness,
-            "<b>🛠️ UPDATE STARTED · YRP server (.22)</b>\n",
-            "<b>good</b>",
+            "<b>✅ GOOD RUN DONE · YRP server (.22)</b>\n",
+            "\n✓ First step\n✓ Second: 2 things done\nTook ",
         )
         .await;
+    assert!(!done.contains("alerts"), "{done}");
     assert!(
-        started.contains("\n2 steps: <code>quick:first</code>, <code>quick:second</code>\n"),
-        "{started}"
+        *bot.edits.lock().unwrap() > 0,
+        "the start message is edited"
     );
-    bot.expect(
-        &harness,
-        "<b>✅ UPDATE DONE · YRP server (.22)</b>\n",
-        "<b>good</b> · all 2 steps done",
-    )
-    .await;
 
     let id = harness.run("bad", false).await.unwrap();
     harness.wait_for_status(id, "failed").await;
-    let failed = bot
-        .expect(
-            &harness,
-            "<b>❌ UPDATE FAILED · YRP server (.22)</b>\n",
-            "Failed at step 2/3 <code>quick:broken</code>: exit code 1",
-        )
-        .await;
-    assert!(
-        failed.contains("\nRecovery: 1 step ran, all OK\n"),
-        "{failed}"
-    );
+    bot.expect(
+        &harness,
+        "<b>❌ BAD FAILED · YRP server (.22)</b>\n",
+        "\n✓ First step\nFailed at: Broken: exit code 1\n↩ Roll back\nTook ",
+    )
+    .await;
 
     let id = harness.run("quiet", false).await.unwrap();
     harness.wait_for_status(id, "succeeded").await;
     let id = harness.run("quick:first", false).await.unwrap();
     harness.wait_for_status(id, "succeeded").await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    assert_eq!(bot.texts().len(), 4, "{:?}", bot.texts());
+    assert_eq!(bot.texts().len(), 2, "{:?}", bot.texts());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -435,19 +441,12 @@ async fn a_job_holds_alerts_until_its_grace_time_ends() {
         })
         .await;
     assert_eq!(harness.job(id).await["job"]["status"], "running");
-    let started = bot
-        .expect(
-            &harness,
-            "<b>🛠️ UPDATE STARTED · test-host</b>\n",
-            "<b>slow</b>",
-        )
-        .await;
-    assert!(
-        started.ends_with(
-            "\nAlerts for this server are paused during the job and for under a minute after it."
-        ),
-        "{started}"
-    );
+    bot.expect(
+        &harness,
+        "<b>⏳ SLOW RUNNING · test-host</b>\n",
+        "\n⏳ 1/1 Wait…",
+    )
+    .await;
 
     harness.wait_for_status(id, "succeeded").await;
     bot.expect(&harness, "<b>🔴 CRITICAL · test-host</b>\n", "<b>Disk ")
@@ -460,9 +459,13 @@ async fn a_job_holds_alerts_until_its_grace_time_ends() {
     assert_eq!(
         titles,
         [
-            "<b>🛠️ UPDATE STARTED · test-host</b>",
-            "<b>✅ UPDATE DONE · test-host</b>",
+            "<b>✅ SLOW DONE · test-host</b>",
             "<b>🔴 CRITICAL · test-host</b>",
         ]
+    );
+    assert!(
+        bot.texts()[0].ends_with(". No alerts were sent during the update."),
+        "{:?}",
+        bot.texts()
     );
 }

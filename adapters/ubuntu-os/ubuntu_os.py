@@ -11,14 +11,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import snapshots
 from upkeep_adapter import (
     EXIT_REBOOT,
-    AdapterError,
     Context,
     check_manifest_health,
+    count,
     log,
     main,
     matches_any,
     result,
     run,
+    verify_failed,
     wait_until_healthy,
 )
 
@@ -64,6 +65,7 @@ SKIPPED_UNITS = (
     "snapd*",
 )
 
+KERNEL_PACKAGE = re.compile(r"^linux-image-(\d[^-]*(?:-\d+)?)")
 INSTALL_LINE = re.compile(r"^Inst (\S+) (?:\[([^\]]*)\] )?\((\S+)")
 REMOVE_LINE = re.compile(r"^Remv (\S+)(?: \[([^\]]*)\])?")
 
@@ -101,7 +103,30 @@ def check_updates(context: Context) -> None:
     )
     if held:
         log(f"held during update: {', '.join(held)}")
-    result(**plan, held=held)
+    result(**plan, held=held, summary=[updates_summary(plan)])
+
+
+def updates_summary(plan: dict) -> str:
+    """For example "51 updates found, 9 important"."""
+    found = len(plan["upgrades"])
+    if not found:
+        return "no updates found"
+    important = len(plan["risky"])
+    return f"{count(found, 'update')} found" + (f", {important} important" if important else "")
+
+
+def update_summary(upgraded: list[dict], removed: list[dict], reboot: bool) -> list[str]:
+    """For example ["51 packages updated", "kernel 7.0.0-43", "restart needed"]."""
+    if not upgraded and not removed:
+        return ["nothing to update"]
+    lines = [f"{count(len(upgraded), 'package')} updated"]
+    if removed:
+        lines.append(f"{count(len(removed), 'package')} removed")
+    kernels = [match.group(1) for package in upgraded if (match := KERNEL_PACKAGE.match(package["name"]))]
+    lines += [f"kernel {kernel}" for kernel in kernels]
+    if reboot:
+        lines.append("restart needed")
+    return lines
 
 
 def held_packages() -> set[str]:
@@ -146,7 +171,13 @@ def update(context: Context) -> int | None:
             run(["systemctl", "start", *stopped])
 
     reboot = needs_reboot(plan["upgrades"])
-    result(upgraded=plan["upgrades"], removed=plan["removals"], held=held, reboot_required=reboot)
+    result(
+        upgraded=plan["upgrades"],
+        removed=plan["removals"],
+        held=held,
+        reboot_required=reboot,
+        summary=update_summary(plan["upgrades"], plan["removals"], reboot),
+    )
     if reboot:
         log("reboot required", level="warn")
         return EXIT_REBOOT
@@ -161,8 +192,10 @@ def failed_units(ignore: list[str]) -> list[str]:
 def verify(context: Context) -> None:
     problems = wait_until_healthy(context, lambda: check_health(context))
     if problems:
-        raise AdapterError(f"verify failed: {'; '.join(problems)}")
+        raise verify_failed(problems)
     log("all checks passed")
+    checks = len(context.manifest.get("service", [])) + len(context.manifest.get("ping", []))
+    result(summary=[f"all {checks} services and pings OK, no failed units" if checks else "no failed units"])
 
 
 def check_health(context: Context) -> list[str]:

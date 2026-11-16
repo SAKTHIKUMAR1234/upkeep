@@ -48,6 +48,7 @@ pub enum ManifestError {
 struct RawManifest {
     name: String,
     run: String,
+    display_name: Option<String>,
     #[serde(default)]
     writes_data: bool,
     #[serde(default)]
@@ -61,6 +62,7 @@ struct RawManifest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAction {
+    title: Option<String>,
     timeout: Option<String>,
     #[serde(default)]
     needs: Vec<String>,
@@ -81,6 +83,8 @@ struct RawPing {
 pub struct Manifest {
     pub name: String,
     pub run: String,
+    /// The plain name in messages, such as "HR staging".
+    pub display_name: Option<String>,
     pub writes_data: bool,
     pub actions: BTreeMap<String, Action>,
     pub services: Vec<Service>,
@@ -89,6 +93,8 @@ pub struct Manifest {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Action {
+    /// The plain step name in messages, such as "Taking snapshot".
+    pub title: Option<String>,
     #[serde(rename = "timeout_secs", serialize_with = "serialize_secs")]
     pub timeout: Duration,
     pub needs: Vec<String>,
@@ -184,6 +190,7 @@ impl Manifest {
         Ok(Self {
             name: raw.name,
             run: raw.run,
+            display_name: raw.display_name,
             writes_data: raw.writes_data,
             actions,
             services,
@@ -250,6 +257,7 @@ fn parse_actions(
         .map(|(name, action)| {
             let timeout = parse_action_timeout(&name, action.timeout.as_deref())?;
             let parsed = Action {
+                title: action.title,
                 timeout,
                 needs: action.needs,
             };
@@ -335,10 +343,12 @@ mod tests {
     const VALID: &str = r#"
 name = "bench"
 run = "python3 adapter.py"
+display_name = "HR staging"
 writes_data = true
 
 [actions.maintenance_on]
 [actions.backup]
+title = "Saving a backup"
 timeout = "60m"
 [actions.update]
 timeout = "90m"
@@ -374,6 +384,12 @@ timeout = "5s"
         let manifest = Manifest::parse(VALID, "bench").unwrap();
 
         assert!(manifest.writes_data);
+        assert_eq!(manifest.display_name.as_deref(), Some("HR staging"));
+        assert_eq!(
+            manifest.actions["backup"].title.as_deref(),
+            Some("Saving a backup")
+        );
+        assert_eq!(manifest.actions["update"].title, None);
         assert_eq!(
             manifest.actions["backup"].timeout,
             Duration::from_secs(3600)

@@ -1,5 +1,6 @@
 name = "hr-dev"
 run = "python3 /usr/local/lib/upkeep/adapters/frappe-bench/frappe_bench.py"
+display_name = "HR dev"
 writes_data = true
 
 [actions.maintenance_on]

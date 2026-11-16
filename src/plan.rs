@@ -36,12 +36,14 @@ pub enum PlanError {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Plan {
+    /// The plain name in messages, such as "OS update".
+    pub title: Option<String>,
     #[serde(default)]
     pub confirm: bool,
     pub steps: Vec<String>,
     #[serde(default)]
     pub on_failure: Vec<String>,
-    /// Send Telegram messages when a job of this plan starts and ends.
+    /// Keep one Telegram message for each job of this plan, edited while it runs.
     #[serde(default = "yes")]
     pub notify: bool,
 }
@@ -90,7 +92,7 @@ impl Plan {
     }
 }
 
-/// A job announces its start and end when it runs a plan that does not set `notify = false`.
+/// A job gets a Telegram message when it runs a plan that does not set `notify = false`.
 /// A single `adapter:action` is not announced.
 pub fn notifies(target: &str, plans_dir: &Path) -> bool {
     !target.contains(':') && Plan::load(plans_dir, target).map_or(true, |plan| plan.notify)

@@ -27,11 +27,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const START_GRACE: Duration = Duration::from_secs(15);
 const EVENT_BUFFER: usize = 64;
 
-/// A job started or finished. The monitor announces these on Telegram.
+/// A job started, moved to another step or finished. The monitor announces these on Telegram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobEvent {
     Started(i64),
+    StepChanged(i64),
     Finished(i64),
+}
+
+impl JobEvent {
+    pub fn job_id(self) -> i64 {
+        match self {
+            Self::Started(job_id) | Self::StepChanged(job_id) | Self::Finished(job_id) => job_id,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -222,6 +231,7 @@ impl Runner {
             self.store
                 .finish_step(&step, &outcome, &current_boot_id()?)?;
             self.log(job_id, &describe(&step, &outcome));
+            self.announce(JobEvent::StepChanged(job_id));
             match outcome.status {
                 StepStatus::Reboot => match self.reboot(job_id).await {
                     Ok(()) => return Ok(()),
@@ -283,6 +293,7 @@ impl Runner {
             dir.prepare(&self.step_file(step), &self.context(job, step)?)?;
             self.store.mark_step_running(step)?;
             self.log(job.id, &format!("step {} started", label(step)));
+            self.announce(JobEvent::StepChanged(job.id));
         } else {
             self.log(job.id, &format!("step {} re-attached", label(step)));
         }

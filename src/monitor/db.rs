@@ -38,7 +38,14 @@ CREATE TABLE IF NOT EXISTS outbox (
     created_at INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     next_attempt_at INTEGER NOT NULL,
-    last_error TEXT
+    last_error TEXT,
+    job_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS job_messages (
+    job_id INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (
     name TEXT PRIMARY KEY,
@@ -55,6 +62,8 @@ const ADDED_CHECK_COLUMNS: &[(&str, &str)] = &[
     ("subject", "TEXT"),
     ("amount", "REAL"),
 ];
+/// Outbox columns added after the first release, with their definitions.
+const ADDED_OUTBOX_COLUMNS: &[(&str, &str)] = &[("job_id", "INTEGER")];
 /// The outbox holds Telegram HTML since this format version.
 const OUTBOX_FORMAT: (&str, &str) = ("outbox_format", "html");
 
@@ -93,6 +102,8 @@ pub struct Pending {
     pub id: i64,
     pub text: String,
     pub attempts: u32,
+    /// The job whose one message this text sends or edits.
+    pub job_id: Option<i64>,
 }
 
 /// Monitor state, check history and the alert outbox, in `monitor.db` next to the job database.
@@ -223,13 +234,15 @@ impl MonitorDb {
     /// Messages to send now, oldest first. A message that waits for a retry holds back the newer ones, to keep order.
     pub fn due(&self, now: i64) -> rusqlite::Result<Vec<Pending>> {
         let connection = self.lock();
-        let mut statement = connection
-            .prepare("SELECT id, text, attempts, next_attempt_at FROM outbox ORDER BY id")?;
+        let mut statement = connection.prepare(
+            "SELECT id, text, attempts, next_attempt_at, job_id FROM outbox ORDER BY id",
+        )?;
         let rows = statement.query_map([], |row| {
             let pending = Pending {
                 id: row.get(0)?,
                 text: row.get(1)?,
                 attempts: row.get(2)?,
+                job_id: row.get(4)?,
             };
             Ok((pending, row.get::<_, i64>(3)?))
         })?;
@@ -244,10 +257,67 @@ impl MonitorDb {
         Ok(due)
     }
 
-    pub fn delivered(&self, id: i64) -> rusqlite::Result<()> {
-        self.lock()
-            .execute("DELETE FROM outbox WHERE id = ?1", [id])?;
+    /// Removes a sent message and keeps a job's Telegram message id for later edits.
+    /// A job text changed while it was sent stays queued, so the newer text is sent too.
+    pub fn delivered(
+        &self,
+        pending: &Pending,
+        message_id: Option<i64>,
+        now: i64,
+    ) -> rusqlite::Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM outbox WHERE id = ?1 AND text = ?2",
+            params![pending.id, pending.text],
+        )?;
+        if let (Some(job_id), Some(message_id)) = (pending.job_id, message_id) {
+            transaction.execute(
+                "INSERT INTO job_messages (job_id, message_id, text, updated_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (job_id) DO UPDATE SET message_id = ?2, text = ?3, updated_at = ?4",
+                params![job_id, message_id, pending.text, now],
+            )?;
+        }
+        transaction.commit()
+    }
+
+    /// Queues the newest text of a job's message. It replaces a text of that job that still waits.
+    pub fn queue_job_text(&self, job_id: i64, text: &str, now: i64) -> rusqlite::Result<()> {
+        let connection = self.lock();
+        let replaced = connection.execute(
+            "UPDATE outbox SET text = ?2 WHERE job_id = ?1",
+            params![job_id, text],
+        )?;
+        if replaced == 0 {
+            connection.execute(
+                "INSERT INTO outbox (text, created_at, next_attempt_at, job_id) VALUES (?1, ?2, ?2, ?3)",
+                params![text, now, job_id],
+            )?;
+        }
         Ok(())
+    }
+
+    /// The newest text of a job's message: the one that waits, else the one Telegram shows.
+    pub fn job_text(&self, job_id: i64) -> rusqlite::Result<Option<String>> {
+        self.lock()
+            .query_row(
+                "SELECT text FROM (SELECT text, 0 AS rank FROM outbox WHERE job_id = ?1 \
+                 UNION ALL SELECT text, 1 FROM job_messages WHERE job_id = ?1) ORDER BY rank LIMIT 1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// The Telegram message id of a job's message, once it was sent.
+    pub fn job_message_id(&self, job_id: i64) -> rusqlite::Result<Option<i64>> {
+        self.lock()
+            .query_row(
+                "SELECT message_id FROM job_messages WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
     }
 
     pub fn retry_later(&self, id: i64, next_attempt_at: i64, error: &str) -> rusqlite::Result<()> {
@@ -258,10 +328,11 @@ impl MonitorDb {
         Ok(())
     }
 
-    /// Drops messages created before `cutoff` and returns how many.
+    /// Drops messages created before `cutoff` and returns how many. Old job message ids go too.
     pub fn expire(&self, cutoff: i64) -> rusqlite::Result<usize> {
-        self.lock()
-            .execute("DELETE FROM outbox WHERE created_at < ?1", [cutoff])
+        let connection = self.lock();
+        connection.execute("DELETE FROM job_messages WHERE updated_at < ?1", [cutoff])?;
+        connection.execute("DELETE FROM outbox WHERE created_at < ?1", [cutoff])
     }
 
     pub fn outbox_len(&self) -> rusqlite::Result<i64> {
@@ -288,22 +359,33 @@ impl MonitorDb {
 
 /// Brings a database from an older release to the current shape.
 fn upgrade(connection: &Connection) -> rusqlite::Result<()> {
+    let added = add_columns(connection, "checks", ADDED_CHECK_COLUMNS)?;
+    if added.contains(&"streak_since") {
+        connection.execute_batch("UPDATE checks SET streak_since = updated_at")?;
+    }
+    add_columns(connection, "outbox", ADDED_OUTBOX_COLUMNS)?;
+    escape_old_outbox(connection)
+}
+
+/// Adds the missing columns to `table` and returns their names.
+fn add_columns(
+    connection: &Connection,
+    table: &str,
+    columns: &[(&'static str, &str)],
+) -> rusqlite::Result<Vec<&'static str>> {
     let mut added = Vec::new();
-    for (column, definition) in ADDED_CHECK_COLUMNS {
+    for (column, definition) in columns {
         let exists = connection
-            .prepare("SELECT 1 FROM pragma_table_info('checks') WHERE name = ?1")?
-            .exists([column])?;
+            .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+            .exists([table, column])?;
         if !exists {
             connection.execute_batch(&format!(
-                "ALTER TABLE checks ADD COLUMN {column} {definition}"
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
             ))?;
             added.push(*column);
         }
     }
-    if added.contains(&"streak_since") {
-        connection.execute_batch("UPDATE checks SET streak_since = updated_at")?;
-    }
-    escape_old_outbox(connection)
+    Ok(added)
 }
 
 /// Messages queued by an older release are plain text: escapes them for parse_mode=HTML.
@@ -395,6 +477,7 @@ mod tests {
             (0, 9, None)
         );
         assert_eq!(db.due(1).unwrap()[0].text, "a &lt;b&gt; &amp; c");
+        assert_eq!(db.due(1).unwrap()[0].job_id, None);
         drop(db);
         let again = MonitorDb::open(&path).unwrap();
         assert_eq!(again.due(1).unwrap()[0].text, "a &lt;b&gt; &amp; c");
@@ -441,9 +524,39 @@ mod tests {
 
         drop(db);
         let reopened = MonitorDb::open(&path).unwrap();
-        reopened.delivered(first).unwrap();
+        let sent = reopened.due(160).unwrap().remove(0);
+        reopened.delivered(&sent, None, 160).unwrap();
         assert_eq!(reopened.outbox_len().unwrap(), 1);
         assert_eq!(reopened.expire(101).unwrap(), 1);
         assert_eq!(reopened.outbox_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_job_keeps_one_queued_text_and_its_message_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MonitorDb::open(&dir.path().join("monitor.db")).unwrap();
+        db.queue_job_text(7, "running 1/2", 100).unwrap();
+        db.queue_job_text(7, "running 2/2", 110).unwrap();
+        assert_eq!(db.outbox_len().unwrap(), 1);
+        assert_eq!(db.job_text(7).unwrap().as_deref(), Some("running 2/2"));
+
+        let sent = db.due(110).unwrap().remove(0);
+        assert_eq!(sent.job_id, Some(7));
+        db.queue_job_text(7, "done", 120).unwrap();
+        db.delivered(&sent, Some(555), 120).unwrap();
+        assert_eq!(db.job_message_id(7).unwrap(), Some(555));
+        assert_eq!(
+            db.due(120).unwrap()[0].text,
+            "done",
+            "a text queued while sending stays queued"
+        );
+
+        let done = db.due(120).unwrap().remove(0);
+        db.delivered(&done, Some(555), 130).unwrap();
+        assert_eq!(db.outbox_len().unwrap(), 0);
+        assert_eq!(db.job_text(7).unwrap().as_deref(), Some("done"));
+        assert_eq!(db.job_text(8).unwrap(), None);
+        db.expire(131).unwrap();
+        assert_eq!(db.job_message_id(7).unwrap(), None);
     }
 }

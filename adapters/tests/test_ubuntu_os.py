@@ -65,6 +65,39 @@ class CheckUpdatesTest(unittest.TestCase):
         self.assertIn('"held": ["mariadb-server"]', output.getvalue())
 
 
+class SummaryTest(unittest.TestCase):
+    def test_check_updates_counts_updates_and_important_ones(self):
+        plan = ubuntu_os.parse_simulation(fixture("apt-simulate.txt"))
+        plan["risky"] = [package["name"] for package in plan["upgrades"] if package["risky"]]
+        self.assertEqual(ubuntu_os.updates_summary(plan), "6 updates found, 4 important")
+        self.assertEqual(ubuntu_os.updates_summary({"upgrades": [], "risky": []}), "no updates found")
+        self.assertEqual(ubuntu_os.updates_summary({"upgrades": [{"name": "curl"}], "risky": []}), "1 update found")
+
+    def test_update_names_packages_kernel_and_restart(self):
+        plan = ubuntu_os.parse_simulation(fixture("apt-simulate.txt"))
+        self.assertEqual(
+            ubuntu_os.update_summary(plan["upgrades"], plan["removals"], reboot=True),
+            ["6 packages updated", "1 package removed", "kernel 7.0.0-44", "restart needed"],
+        )
+        meta = [{"name": "linux-image-generic"}, {"name": "linux-image-6.12.117+deb13-cloud-amd64"}]
+        self.assertEqual(
+            ubuntu_os.update_summary(meta, [], reboot=False), ["2 packages updated", "kernel 6.12.117+deb13"]
+        )
+        self.assertEqual(ubuntu_os.update_summary([], [], reboot=False), ["nothing to update"])
+
+    def test_verify_counts_services_and_pings(self):
+        manifest = {"service": [{"name": "a"}, {"name": "b"}], "ping": [{"name": "c"}]}
+        context = Context(data={}, adapter_dir=Path("."), manifest=manifest, config={"verify_wait": 0})
+        output = io.StringIO()
+        with (
+            mock.patch.object(ubuntu_os, "run", return_value=""),
+            mock.patch.object(ubuntu_os, "check_manifest_health", return_value=[]),
+            contextlib.redirect_stdout(output),
+        ):
+            ubuntu_os.verify(context)
+        self.assertIn('"summary": ["all 3 services and pings OK, no failed units"]', output.getvalue())
+
+
 class RebootTest(unittest.TestCase):
     def test_a_kernel_upgrade_needs_a_reboot_without_the_flag_file(self):
         with mock.patch.object(ubuntu_os, "REBOOT_REQUIRED", Path("/nonexistent/reboot-required")):
@@ -90,6 +123,7 @@ class UnitsTest(unittest.TestCase):
         ):
             ubuntu_os.verify(context)
         self.assertIn("failed unit motd-news.service", str(raised.exception))
+        self.assertEqual(raised.exception.plain, "not working: failed unit motd-news.service")
 
 
 class DiscoverTest(unittest.TestCase):

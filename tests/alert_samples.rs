@@ -1,8 +1,12 @@
 use std::path::PathBuf;
-use std::time::Duration;
 
+use serde_json::json;
+
+use upkeep::engine::step_dir::Progress;
 use upkeep::monitor::checks::{Level, Observation};
 use upkeep::monitor::message::digest::{HostReport, Section};
+use upkeep::monitor::message::job::JobView;
+use upkeep::monitor::message::titles::Titles;
 use upkeep::monitor::message::{Event, Letterhead};
 use upkeep::monitor::settings::TelegramSettings;
 use upkeep::monitor::state::{CheckState, Notice};
@@ -53,18 +57,18 @@ fn job(status: JobStatus, created_at: i64, finished_at: Option<i64>, error: Opti
 
 fn steps(statuses: &[StepStatus]) -> Vec<Step> {
     let names = [
-        "erp:maintenance_on",
-        "erp:backup",
-        "os:snapshot",
-        "os:update",
-        "os:verify",
-        "erp:maintenance_off",
+        ("erp:maintenance_on", "databases and apps stopped"),
+        ("erp:backup", "backup of erp.example.test saved"),
+        ("os:snapshot", "113 GB read, 43 GB stored"),
+        ("os:update", "51 packages updated"),
+        ("os:verify", "all 14 services and pings OK"),
+        ("erp:maintenance_off", "maintenance off: erp.example.test"),
     ];
     names
         .iter()
         .zip(statuses)
         .enumerate()
-        .map(|(index, (name, status))| {
+        .map(|(index, ((name, summary), status))| {
             let (adapter, action) = name.split_once(':').unwrap();
             Step {
                 job_id: 1,
@@ -77,9 +81,11 @@ fn steps(statuses: &[StepStatus]) -> Vec<Step> {
                 timeout_secs: 600,
                 status: *status,
                 exit_code: None,
-                result: None,
-                error: (*status == StepStatus::Failed)
-                    .then(|| "exit code 100: dpkg was interrupted".to_owned()),
+                result: Some(match status {
+                    StepStatus::Failed => json!({"error": "E: dpkg was interrupted"}),
+                    _ => json!({"summary": [summary]}),
+                }),
+                error: (*status == StepStatus::Failed).then(|| "exit code 100".to_owned()),
                 started_at: None,
                 finished_at: None,
             }
@@ -192,12 +198,26 @@ fn samples(now: i64) -> Vec<String> {
     };
     messages.push(yrp.digest(&[Section::Host(yrp_host), Section::Host(replica_host)], now));
 
-    let pending = [StepStatus::Pending; 6];
-    let running = job(JobStatus::Running, now, None, None);
-    messages.push(replica.job_started(&running, &steps(&pending), Duration::from_secs(300)));
+    let titles = Titles {
+        plan: Some("OS update".into()),
+        ..Titles::default()
+    };
+    let progress = Progress {
+        percent: Some(29.0),
+        message: "32768 MiB read, 210000 files".into(),
+    };
+    let view = JobView {
+        titles: &titles,
+        progress: Some(&progress),
+        alerts_held: true,
+    };
+    let running = job(JobStatus::Running, now - 4 * MINUTE, None, None);
+    let mut in_progress = [StepStatus::Pending; 6];
+    in_progress[..3].copy_from_slice(&[StepStatus::Ok, StepStatus::Ok, StepStatus::Running]);
+    messages.push(replica.job_message(&running, &steps(&in_progress), view, now));
 
     let done = job(JobStatus::Succeeded, now - 18 * MINUTE, Some(now), None);
-    messages.push(replica.job_finished(&done, &steps(&[StepStatus::Ok; 6]), now));
+    messages.push(replica.job_message(&done, &steps(&[StepStatus::Ok; 6]), view, now));
 
     let failed_steps = [
         StepStatus::Ok,
@@ -213,7 +233,7 @@ fn samples(now: i64) -> Vec<String> {
         Some(now),
         Some("step os:update failed"),
     );
-    messages.push(replica.job_finished(&failed, &steps(&failed_steps), now));
+    messages.push(replica.job_message(&failed, &steps(&failed_steps), view, now));
     messages
 }
 

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,17 @@ pub struct ExitRecord {
     pub result: Option<Value>,
     pub error: Option<String>,
 }
+
+/// The latest progress line of a running step.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Progress {
+    pub percent: Option<f64>,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// Bytes at the end of `stdout.jsonl` searched for the latest progress line.
+const PROGRESS_TAIL: u64 = 64 * 1024;
 
 /// Identifies the step process, safe against pid reuse and reboots.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -123,6 +134,25 @@ impl StepDir {
     pub fn read_exit(&self) -> io::Result<Option<ExitRecord>> {
         read_json(&self.path.join("exit.json"))
     }
+
+    /// The newest progress line in the end of `stdout.jsonl`, if any.
+    pub fn last_progress(&self) -> io::Result<Option<Progress>> {
+        let mut file = match std::fs::File::open(self.stdout_file()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let length = file.metadata()?.len();
+        file.seek(SeekFrom::Start(length.saturating_sub(PROGRESS_TAIL)))?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)?;
+        Ok(String::from_utf8_lossy(&tail)
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|message| message["type"] == "progress")
+            .and_then(|message| serde_json::from_value(message).ok()))
+    }
 }
 
 impl Owner {
@@ -203,6 +233,28 @@ mod tests {
             ..Owner::current().unwrap()
         };
         assert!(!rebooted.is_alive());
+    }
+
+    #[test]
+    fn last_progress_reads_the_newest_progress_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = StepDir::new(dir.path().to_path_buf());
+        assert_eq!(step.last_progress().unwrap(), None);
+
+        let lines = [
+            r#"{"type":"progress","percent":10,"message":"start"}"#,
+            "plain text",
+            r#"{"type":"progress","percent":29,"message":"1 GiB read"}"#,
+            r#"{"type":"log","level":"info","message":"x"}"#,
+        ];
+        std::fs::write(step.stdout_file(), lines.join("\n")).unwrap();
+        assert_eq!(
+            step.last_progress().unwrap(),
+            Some(Progress {
+                percent: Some(29.0),
+                message: "1 GiB read".into()
+            })
+        );
     }
 
     #[test]
