@@ -1,0 +1,2 @@
+confirm = true
+steps = ["os:update", "os:verify"]

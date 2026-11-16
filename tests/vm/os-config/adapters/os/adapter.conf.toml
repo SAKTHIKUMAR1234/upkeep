@@ -1,0 +1,2 @@
+hold = ["openssh-server", "mariadb-*", "docker*", "containerd*"]
+ignore_failed_units = []
