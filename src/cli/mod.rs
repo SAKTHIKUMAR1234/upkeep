@@ -1,3 +1,4 @@
+mod monitor;
 mod output;
 mod registry;
 mod snapshots;
@@ -14,6 +15,7 @@ use crate::client::hosts::Hosts;
 use crate::client::{Client, Endpoint};
 use crate::paths::Paths;
 use crate::secrets::Secrets;
+pub use monitor::AlertCommand;
 pub use registry::{DestCommand, HostCommand};
 
 #[derive(Debug, Parser)]
@@ -43,8 +45,17 @@ pub struct Cli {
 pub enum Command {
     /// Run the runner daemon.
     Serve,
-    /// Show health and the latest job.
-    Status,
+    /// Show the monitor checks and the latest job.
+    Status {
+        /// Show every registered host in one table.
+        #[arg(long, conflicts_with = "remote")]
+        all: bool,
+    },
+    /// Telegram alerts of the runner.
+    Alert {
+        #[command(subcommand)]
+        command: AlertCommand,
+    },
     /// List adapters, their actions and manifest errors.
     Adapters,
     /// Start a plan or a single adapter:action.
@@ -160,6 +171,7 @@ fn remote_client(dir: &ClientDir, name: &str) -> anyhow::Result<Client> {
 /// Runs a client subcommand.
 pub async fn run_client(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
+        Command::Status { all: true } => monitor::print_all(&cli.client_dir()?).await,
         Command::Host { command } => registry::host(command, &cli.client_dir()?),
         Command::Dest { command } => registry::dest(command, &cli.client_dir()?),
         Command::Snapshot { host, to, plan } => {
@@ -190,14 +202,20 @@ pub async fn run_client(cli: &Cli) -> anyhow::Result<()> {
 async fn run_job_command(cli: &Cli, command: &Command) -> anyhow::Result<()> {
     let client = cli.client()?;
     match command {
-        Command::Status => {
-            output::print_health(&client.get("/health").await?);
+        Command::Status { .. } => {
+            let report = client.get("/monitor").await?;
+            if report["enabled"] == true {
+                monitor::print_checks(&report);
+            } else {
+                output::print_health(&client.get("/health").await?);
+            }
             let jobs = client.get("/jobs?limit=1").await?;
             match jobs["jobs"].as_array().and_then(|jobs| jobs.first()) {
                 Some(job) => println!("\nlatest job:\n{}", output::job_line(job)),
                 None => println!("\nno jobs yet"),
             }
         }
+        Command::Alert { command } => monitor::alert(&client, command).await?,
         Command::Adapters => output::print_adapters(&client.get("/adapters").await?),
         Command::Run {
             target,
