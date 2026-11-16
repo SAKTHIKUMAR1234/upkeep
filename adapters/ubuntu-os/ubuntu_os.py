@@ -94,7 +94,13 @@ def simulate() -> dict:
 
 
 def check_updates(context: Context) -> None:
-    result(**simulate())
+    plan = simulate()
+    held = sorted(
+        package["name"] for package in plan["upgrades"] if matches_any(package["name"], context.config.get("hold", []))
+    )
+    if held:
+        log(f"held during update: {', '.join(held)}")
+    result(**plan, held=held)
 
 
 def held_packages() -> set[str]:

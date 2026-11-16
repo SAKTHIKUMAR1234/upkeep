@@ -53,6 +53,18 @@ class HoldTest(unittest.TestCase):
         self.assertEqual(held, ["docker-ce", "mariadb-server"])
 
 
+class CheckUpdatesTest(unittest.TestCase):
+    def test_lists_the_upgrades_that_update_will_hold(self):
+        context = Context(data={}, adapter_dir=Path("."), config={"hold": ["mariadb-*", "redis*"]})
+        output = io.StringIO()
+        with (
+            mock.patch.object(ubuntu_os, "run", side_effect=["", fixture("apt-simulate.txt")]),
+            contextlib.redirect_stdout(output),
+        ):
+            ubuntu_os.check_updates(context)
+        self.assertIn('"held": ["mariadb-server"]', output.getvalue())
+
+
 class RebootTest(unittest.TestCase):
     def test_a_kernel_upgrade_needs_a_reboot_without_the_flag_file(self):
         with mock.patch.object(ubuntu_os, "REBOOT_REQUIRED", Path("/nonexistent/reboot-required")):
