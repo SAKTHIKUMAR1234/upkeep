@@ -16,10 +16,10 @@ use tokio::net::{TcpStream, UnixStream};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("cannot connect to {target}: {source} (is `upkeep serve` running?)")]
+    #[error("cannot connect to {target}: {reason} ({})", connect_hint(.reason))]
     Connect {
         target: String,
-        source: std::io::Error,
+        reason: std::io::Error,
     },
     #[error("http: {0}")]
     Http(#[from] hyper::Error),
@@ -27,6 +27,13 @@ pub enum ClientError {
     Status { status: u16, message: String },
     #[error("invalid response: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+fn connect_hint(reason: &std::io::Error) -> &'static str {
+    match reason.kind() {
+        std::io::ErrorKind::PermissionDenied => "the local socket is for root: use sudo",
+        _ => "is `upkeep serve` running?",
+    }
 }
 
 /// Where the runner API listens.
@@ -97,9 +104,9 @@ impl Client {
                 let stream =
                     UnixStream::connect(path)
                         .await
-                        .map_err(|source| ClientError::Connect {
+                        .map_err(|reason| ClientError::Connect {
                             target: path.display().to_string(),
-                            source,
+                            reason,
                         })?;
                 exchange(stream, request).await
             }
@@ -107,9 +114,9 @@ impl Client {
                 let stream =
                     TcpStream::connect(address)
                         .await
-                        .map_err(|source| ClientError::Connect {
+                        .map_err(|reason| ClientError::Connect {
                             target: address.clone(),
-                            source,
+                            reason,
                         })?;
                 exchange(stream, request).await
             }
@@ -157,4 +164,35 @@ async fn json_body(response: Response<Incoming>) -> Result<Value, ClientError> {
         .await?
         .to_bytes();
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Error, ErrorKind};
+
+    use super::*;
+
+    #[test]
+    fn connect_errors_say_once_why_and_what_to_do() {
+        let denied = ClientError::Connect {
+            target: "/var/lib/upkeep/upkeep.sock".into(),
+            reason: Error::from(ErrorKind::PermissionDenied),
+        };
+        let text = format!("{:#}", anyhow::Error::from(denied));
+        assert_eq!(
+            text,
+            "cannot connect to /var/lib/upkeep/upkeep.sock: permission denied \
+             (the local socket is for root: use sudo)"
+        );
+
+        let refused = ClientError::Connect {
+            target: "127.0.0.1:7878".into(),
+            reason: Error::from(ErrorKind::ConnectionRefused),
+        };
+        assert!(
+            refused
+                .to_string()
+                .ends_with("(is `upkeep serve` running?)")
+        );
+    }
 }

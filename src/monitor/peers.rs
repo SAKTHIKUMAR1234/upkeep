@@ -36,7 +36,7 @@ async fn reach(peer: &PeerSettings) -> anyhow::Result<()> {
     let client = Client::new(host.endpoint()?);
     match tokio::time::timeout(PEER_TIMEOUT, client.get("/health")).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(ClientError::Connect { source, .. })) => Err(source.into()),
+        Ok(Err(ClientError::Connect { reason, .. })) => Err(reason.into()),
         Ok(Err(error)) => Err(error.into()),
         Err(_) => anyhow::bail!("no answer in {}s", PEER_TIMEOUT.as_secs()),
     }
