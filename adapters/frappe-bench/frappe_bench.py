@@ -25,7 +25,7 @@ from upkeep_adapter import (
     run,
 )
 
-SCHEDULER_STATE_FILE = "scheduler.json"
+SITE_STATE_FILE = "site_state.json"
 JOB_WAIT_INTERVAL = 5
 BACKUP_LINE = re.compile(r"^(Config|Database|Public|Private)\s*:\s*(\S+)")
 
@@ -70,15 +70,25 @@ def user_prefix(user: str | None) -> list[str]:
     return ["runuser", "-u", user, "--", "env", f"HOME={pwd.getpwnam(user).pw_dir}"]
 
 
-def read_scheduler_state(path: Path) -> dict:
+def read_site_state(path: Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
 
-def write_scheduler_state(path: Path, state: dict) -> None:
+def write_site_state(path: Path, state: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, indent=2))
     os.replace(temporary, path)
+
+
+def is_maintenance_mode_on(bench: Bench, site: str) -> bool:
+    output = bench.frappe(site, "show-config", "--format", "json", quiet=True)
+    try:
+        config = json.loads(output[output.index("{") :])[site]
+    except (ValueError, KeyError):
+        # The output holds the site's secrets, so it stays out of the message.
+        raise AdapterError(f"{site}: cannot read maintenance_mode from show-config") from None
+    return bool(config.get("maintenance_mode"))
 
 
 def scheduler_status(bench: Bench, site: str) -> str:
@@ -108,35 +118,42 @@ def wait_for_jobs(bench: Bench, timeout: float) -> None:
 
 def maintenance_on(context: Context) -> None:
     bench = Bench(context.config)
-    state_file = context.state_dir / SCHEDULER_STATE_FILE
-    state = read_scheduler_state(state_file)
+    state_file = context.state_dir / SITE_STATE_FILE
+    state = read_site_state(state_file)
     for site in bench.sites:
         if site not in state:
-            state[site] = scheduler_status(bench, site)
-            write_scheduler_state(state_file, state)
-        log(f"{site}: scheduler was {state[site]}")
+            state[site] = {
+                "scheduler": scheduler_status(bench, site),
+                "maintenance_mode": is_maintenance_mode_on(bench, site),
+            }
+            write_site_state(state_file, state)
+        log(f"{site}: scheduler was {state[site]['scheduler']}, maintenance mode was {state[site]['maintenance_mode']}")
         bench.frappe(site, "set-maintenance-mode", "on")
-        if state[site] == "enabled":
+        if state[site]["scheduler"] == "enabled":
             bench.frappe(site, "scheduler", "disable")
 
     wait_for_jobs(bench, parse_duration(context.config.get("job_wait_timeout"), default=600))
-    result(scheduler_before=state)
+    result(before=state)
 
 
 def maintenance_off(context: Context) -> None:
+    """Restores only sites with a remembered state; sites maintenance_on never reached stay as they are."""
     bench = Bench(context.config)
-    state_file = context.state_dir / SCHEDULER_STATE_FILE
-    state = read_scheduler_state(state_file)
-    if not state:
-        log("no remembered scheduler state: leaving the scheduler as it is", level="warn")
-    enabled = []
+    state_file = context.state_dir / SITE_STATE_FILE
+    state = read_site_state(state_file)
+    scheduler_enabled, maintenance_off_sites = [], []
     for site in bench.sites:
-        if state.get(site) == "enabled":
+        if site not in state:
+            log(f"{site}: no remembered state, leaving it as it is", level="warn")
+            continue
+        if state[site]["scheduler"] == "enabled":
             bench.frappe(site, "scheduler", "enable")
-            enabled.append(site)
-        bench.frappe(site, "set-maintenance-mode", "off")
+            scheduler_enabled.append(site)
+        if not state[site]["maintenance_mode"]:
+            bench.frappe(site, "set-maintenance-mode", "off")
+            maintenance_off_sites.append(site)
     state_file.unlink(missing_ok=True)
-    result(scheduler_enabled=enabled)
+    result(scheduler_enabled=scheduler_enabled, maintenance_off=maintenance_off_sites)
 
 
 def parse_backup_summary(output: str, sites_dir: Path) -> dict[str, str]:

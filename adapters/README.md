@@ -30,4 +30,4 @@ Actions: `maintenance_on`, `maintenance_off`, `backup`, `check_updates`, `update
 | `backup.compress` | `false` | Adds `--compress` to `backup`. |
 | `backup.path` | frappe default | Adds `--backup-path`. |
 
-`maintenance_on` keeps the scheduler state of each site in `<state_dir>/scheduler.json`. `maintenance_off` enables the scheduler again only on the sites where it was enabled, then deletes the file.
+`maintenance_on` keeps the scheduler state and the maintenance mode of each site in `<state_dir>/site_state.json`. `maintenance_off` enables the scheduler again only on the sites where it was enabled, turns maintenance mode off only on the sites where it was off, and then deletes the file. It does not change a site that has no remembered state.

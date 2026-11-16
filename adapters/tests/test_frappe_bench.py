@@ -36,6 +36,10 @@ class FakeShell:
         return [tuple(command[command.index("--site") + 1 :]) for command in self.commands if "--site" in command]
 
 
+def show_config(site: str, maintenance_mode: int) -> str:
+    return json.dumps({site: {"db_name": "x", "maintenance_mode": maintenance_mode}})
+
+
 class ParseTest(unittest.TestCase):
     def test_backup_summary_paths_are_absolute(self):
         files = frappe_bench.parse_backup_summary(
@@ -99,51 +103,80 @@ class MaintenanceTest(unittest.TestCase):
         with mock.patch.object(frappe_bench, "run", shell), contextlib.redirect_stdout(io.StringIO()):
             action(self.context)
 
-    def test_scheduler_is_restored_only_where_it_was_enabled(self):
+    def test_scheduler_and_maintenance_mode_are_restored_per_site(self):
         on = FakeShell(
             {
                 ("a.local", "scheduler", "status", "--format", "json"): '{"status": "enabled", "site": "a.local"}\n',
                 ("b.local", "scheduler", "status", "--format", "json"): '{"status": "disabled", "site": "b.local"}\n',
+                ("a.local", "show-config", "--format", "json"): show_config("a.local", maintenance_mode=0),
+                ("b.local", "show-config", "--format", "json"): show_config("b.local", maintenance_mode=1),
             }
         )
         self.run_action(frappe_bench.maintenance_on, on)
         self.assertIn(("a.local", "scheduler", "disable"), on.frappe_calls())
         self.assertNotIn(("b.local", "scheduler", "disable"), on.frappe_calls())
+        self.assertIn(("a.local", "set-maintenance-mode", "on"), on.frappe_calls())
         self.assertIn(("b.local", "set-maintenance-mode", "on"), on.frappe_calls())
 
         off = FakeShell({})
         self.run_action(frappe_bench.maintenance_off, off)
         self.assertEqual(
             off.frappe_calls(),
-            [
-                ("a.local", "scheduler", "enable"),
-                ("a.local", "set-maintenance-mode", "off"),
-                ("b.local", "set-maintenance-mode", "off"),
-            ],
+            [("a.local", "scheduler", "enable"), ("a.local", "set-maintenance-mode", "off")],
         )
-        self.assertFalse((self.state_dir / "scheduler.json").exists())
+        self.assertFalse((self.state_dir / "site_state.json").exists())
+
+    def test_maintenance_off_leaves_sites_without_remembered_state(self):
+        state = {"a.local": {"scheduler": "disabled", "maintenance_mode": False}}
+        (self.state_dir / "site_state.json").write_text(json.dumps(state))
+        off = FakeShell({})
+        self.run_action(frappe_bench.maintenance_off, off)
+        self.assertEqual(off.frappe_calls(), [("a.local", "set-maintenance-mode", "off")])
 
     def test_a_second_maintenance_on_keeps_the_first_state(self):
-        (self.state_dir / "scheduler.json").write_text(json.dumps({"a.local": "enabled", "b.local": "disabled"}))
+        state = {
+            "a.local": {"scheduler": "enabled", "maintenance_mode": False},
+            "b.local": {"scheduler": "disabled", "maintenance_mode": True},
+        }
+        (self.state_dir / "site_state.json").write_text(json.dumps(state))
         shell = FakeShell({})
         self.run_action(frappe_bench.maintenance_on, shell)
 
-        self.assertNotIn(("a.local", "scheduler", "status", "--format", "json"), shell.frappe_calls())
-        self.assertEqual(json.loads((self.state_dir / "scheduler.json").read_text())["a.local"], "enabled")
+        self.assertFalse(any("status" in call or "show-config" in call for call in shell.frappe_calls()))
+        self.assertEqual(json.loads((self.state_dir / "site_state.json").read_text()), state)
+
+    def test_unreadable_maintenance_mode_fails_without_leaking_config(self):
+        shell = FakeShell({("show-config", "--format", "json"): 'Traceback: db_password = "secret"'})
+        with mock.patch.object(frappe_bench, "run", shell), self.assertRaises(AdapterError) as raised:
+            frappe_bench.is_maintenance_mode_on(frappe_bench.Bench(CONFIG), "a.local")
+        self.assertNotIn("secret", str(raised.exception))
 
     def test_waits_for_jobs_and_fails_on_other_errors(self):
         not_ready = CommandError(
             ["ready-for-migration"], 1, "NOT READY for migration: site a.local has pending background jobs"
         )
         status = '{"status": "disabled", "site": "a.local"}'
-        shell = FakeShell({("ready-for-migration",): not_ready, ("status", "--format", "json"): status})
+        config = ("show-config", "--format", "json")
+        shell = FakeShell(
+            {
+                ("ready-for-migration",): not_ready,
+                ("status", "--format", "json"): status,
+                config: json.dumps({"a.local": {}, "b.local": {}}),
+            }
+        )
         self.context.config = {**CONFIG, "job_wait_timeout": "1ms"}
         with mock.patch.object(frappe_bench.time, "sleep"), self.assertRaises(AdapterError) as raised:
             self.run_action(frappe_bench.maintenance_on, shell)
         self.assertIn("background jobs still running", str(raised.exception))
 
         refused = CommandError(["ready-for-migration"], 1, "redis refused")
-        broken = FakeShell({("ready-for-migration",): refused, ("status", "--format", "json"): status})
+        broken = FakeShell(
+            {
+                ("ready-for-migration",): refused,
+                ("status", "--format", "json"): status,
+                config: json.dumps({"a.local": {}, "b.local": {}}),
+            }
+        )
         with self.assertRaises(CommandError):
             self.run_action(frappe_bench.maintenance_on, broken)
 
