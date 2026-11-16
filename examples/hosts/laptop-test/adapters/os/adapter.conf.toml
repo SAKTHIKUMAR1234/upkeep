@@ -3,3 +3,13 @@ hold = ["mariadb-*", "mysql-*", "galera-*", "docker-ce*", "docker.io", "containe
 
 # Failed units that verify does not count.
 ignore_failed_units = []
+
+# Snapshots with restic over SFTP. Unset fields use the defaults in adapters/README.md.
+[snapshot]
+extra_exclude = []
+extra_mounts = ["/boot", "/boot/efi"]
+
+[snapshot.retention]
+daily = 7
+weekly = 4
+monthly = 12

@@ -10,6 +10,12 @@ timeout = "90m"
 timeout = "2m"
 [actions.discover]
 timeout = "2m"
+[actions.snapshot]
+timeout = "4h"
+[actions.retention]
+timeout = "2h"
+[actions.restore]
+timeout = "4h"
 
 [[service]]
 name = "ssh"

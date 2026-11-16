@@ -1,0 +1,7 @@
+steps = [
+  "writers:maintenance_on",
+  "os:snapshot",
+  "os:retention",
+  "writers:maintenance_off",
+]
+on_failure = ["writers:maintenance_off"]

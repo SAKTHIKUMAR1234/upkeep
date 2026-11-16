@@ -2,6 +2,8 @@ confirm = true
 steps = [
   "writers:maintenance_on",
   "writers:backup",
+  "os:snapshot",
+  "os:retention",
   "os:update",
   "all:verify",
   "writers:maintenance_off",
