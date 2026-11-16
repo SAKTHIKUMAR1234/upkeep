@@ -1,0 +1,28 @@
+NOTE: This is only a simulation!
+      apt-get needs root privileges for real execution.
+      Keep also in mind that locking is deactivated,
+      so don't depend on the relevance to the real current situation!
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+The following NEW packages will be installed:
+  linux-image-7.0.0-44-generic
+The following packages will be REMOVED:
+  libfoo1
+The following packages will be upgraded:
+  curl libcurl4t64 mariadb-server openssh-server systemd
+5 upgraded, 1 newly installed, 1 to remove and 0 not upgraded.
+Remv libfoo1 [1.2-1]
+Inst curl [8.14.1-2ubuntu1] (8.14.1-2ubuntu1.1 Ubuntu:26.04/resolute-updates [amd64])
+Inst libcurl4t64 [8.14.1-2ubuntu1] (8.14.1-2ubuntu1.1 Ubuntu:26.04/resolute-updates [amd64])
+Inst linux-image-7.0.0-44-generic (7.0.0-44.44 Ubuntu:26.04/resolute-updates [amd64])
+Inst mariadb-server [1:11.8.3-1] (1:11.8.3-1ubuntu0.1 Ubuntu:26.04/resolute-security [amd64])
+Inst openssh-server [1:10.0p1-5ubuntu5] (1:10.0p1-5ubuntu5.1 Ubuntu:26.04/resolute-security [amd64])
+Inst systemd [258.1-1ubuntu1] (258.1-1ubuntu2 Ubuntu:26.04/resolute-updates [amd64])
+Conf curl (8.14.1-2ubuntu1.1 Ubuntu:26.04/resolute-updates [amd64])
+Conf libcurl4t64 (8.14.1-2ubuntu1.1 Ubuntu:26.04/resolute-updates [amd64])
+Conf linux-image-7.0.0-44-generic (7.0.0-44.44 Ubuntu:26.04/resolute-updates [amd64])
+Conf mariadb-server (1:11.8.3-1ubuntu0.1 Ubuntu:26.04/resolute-security [amd64])
+Conf openssh-server (1:10.0p1-5ubuntu5.1 Ubuntu:26.04/resolute-security [amd64])
+Conf systemd (258.1-1ubuntu2 Ubuntu:26.04/resolute-updates [amd64])

@@ -1,0 +1,6 @@
+cron.service                     loaded active running Regular background program processing daemon
+mariadb.service                  loaded active running MariaDB 11.8.3 database server
+nginx.service                    loaded active running A high performance web server and a reverse proxy server
+ssh.service                      loaded active running OpenBSD Secure Shell server
+systemd-journald.service         loaded active running Journal Service
+user@1000.service                loaded active running User Manager for UID 1000

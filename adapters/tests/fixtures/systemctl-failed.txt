@@ -1,0 +1,2 @@
+motd-news.service    loaded failed failed Message of the Day
+fwupd-refresh.service loaded failed failed Refresh fwupd metadata
