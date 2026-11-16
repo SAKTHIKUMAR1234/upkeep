@@ -95,6 +95,7 @@ class SshTest(unittest.TestCase):
         text = snapshots.shell_join(snapshots.ssh_command(destination, Path("/t/known_hosts"), None))
         self.assertIn("PubkeyAuthentication=no", text)
         self.assertNotIn("BatchMode", text)
+        self.assertNotIn(",", text, "restic splits -o values on commas")
 
     def test_shell_join_quotes_spaces(self):
         self.assertEqual(snapshots.shell_join(["ssh", "-i", "/my keys/id"]), 'ssh -i "/my keys/id"')

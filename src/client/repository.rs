@@ -119,11 +119,10 @@ pub fn ssh_command(destination: &Destination, known_hosts: &Path) -> Vec<String>
             "BatchMode=yes".into(),
         ]),
         None => command.extend(
+            // restic splits its -o values on commas, so no option here may contain one.
             [
                 "-o",
                 "PubkeyAuthentication=no",
-                "-o",
-                "PreferredAuthentications=password,keyboard-interactive",
                 "-o",
                 "NumberOfPasswordPrompts=1",
             ]
@@ -247,7 +246,7 @@ mod tests {
             Path::new("/s/known_hosts"),
         ));
         assert!(text.contains("-o PubkeyAuthentication=no"));
-        assert!(!text.contains("BatchMode"));
+        assert!(!text.contains("BatchMode") && !text.contains(','));
         assert_eq!(
             askpass_script(Path::new("/home/u/.config/upkeep/secrets/nas.ssh-password")).unwrap(),
             "#!/bin/sh\nexec cat '/home/u/.config/upkeep/secrets/nas.ssh-password'\n"

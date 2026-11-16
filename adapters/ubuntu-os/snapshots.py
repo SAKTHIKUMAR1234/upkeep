@@ -115,14 +115,8 @@ def ssh_command(destination: Destination, known_hosts: Path, key_file: Path | No
     if key_file:
         command += ["-i", str(key_file), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes"]
     else:
-        command += [
-            "-o",
-            "PubkeyAuthentication=no",
-            "-o",
-            "PreferredAuthentications=password,keyboard-interactive",
-            "-o",
-            "NumberOfPasswordPrompts=1",
-        ]
+        # restic splits its -o values on commas, so no option here may contain one.
+        command += ["-o", "PubkeyAuthentication=no", "-o", "NumberOfPasswordPrompts=1"]
     return command + [destination.address, "-s", "sftp"]
 
 
