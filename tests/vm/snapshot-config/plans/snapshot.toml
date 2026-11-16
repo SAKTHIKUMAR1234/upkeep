@@ -1,0 +1,1 @@
+steps = ["os:snapshot", "os:retention"]

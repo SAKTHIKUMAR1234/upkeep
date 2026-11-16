@@ -1,0 +1,7 @@
+[snapshot]
+extra_mounts = ["/boot", "/boot/efi"]
+
+[snapshot.retention]
+daily = 7
+weekly = 4
+monthly = 12
