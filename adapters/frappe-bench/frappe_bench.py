@@ -58,7 +58,9 @@ class Bench:
 
     @property
     def apps(self) -> list[str]:
-        return self.pilot("list-apps", quiet=True).split()
+        """The bench's apps without `skip_apps`, which check_updates and update leave alone."""
+        skipped = set(self.config.get("skip_apps", []))
+        return [app for app in self.pilot("list-apps", quiet=True).split() if app not in skipped]
 
 
 def user_prefix(user: str | None) -> list[str]:

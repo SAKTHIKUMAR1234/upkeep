@@ -196,6 +196,15 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(sum("pull" in command for command in shell.commands), 1)
         self.assertEqual(shell.frappe_calls(), [])
 
+    def test_skipped_apps_are_not_pulled(self):
+        shell = FakeShell({("list-apps",): "frappe\nprivate_app\nhrms\n"})
+        context = Context(data={}, adapter_dir=Path("."), config={**CONFIG, "skip_apps": ["private_app"]})
+        with mock.patch.object(frappe_bench, "run", shell), contextlib.redirect_stdout(io.StringIO()):
+            frappe_bench.update(context)
+
+        pulled = [command[command.index("-C") + 1] for command in shell.commands if "pull" in command]
+        self.assertEqual(pulled, ["/benches/main/apps/frappe", "/benches/main/apps/hrms"])
+
 
 if __name__ == "__main__":
     unittest.main()

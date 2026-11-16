@@ -44,6 +44,7 @@ Actions: `maintenance_on`, `maintenance_off`, `backup`, `check_updates`, `update
 | `bench` | required | Bench name, passed as `pilot --bench`. |
 | `bench_dir` | required | Bench folder. The apps are in `<bench_dir>/apps`. |
 | `sites` | required | Sites for maintenance, backup, migrate and ping. |
+| `skip_apps` | `[]` | Apps that `check_updates` and `update` leave alone, for example private apps the server cannot fetch. |
 | `user` | runner user | Runs Pilot and git as this user. The runner must be root to switch users. |
 | `job_wait_timeout` | `"10m"` | How long `maintenance_on` waits for running background jobs. |
 | `restart` | `true` | `update` runs `pilot restart` at the end. Set `false` for a development bench. |
