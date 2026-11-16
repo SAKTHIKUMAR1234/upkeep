@@ -63,6 +63,7 @@ impl Telegram {
         let mut body = json!({
             "chat_id": self.chat_id,
             "text": text,
+            "parse_mode": "HTML",
             "disable_web_page_preview": true,
         });
         if let Some(thread) = self.message_thread_id {
@@ -217,6 +218,7 @@ mod tests {
         assert_eq!(received[0].0, "bot123:abc");
         assert_eq!(received[0].1["chat_id"], "-100");
         assert_eq!(received[0].1["message_thread_id"], 9);
+        assert_eq!(received[0].1["parse_mode"], "HTML");
         assert_eq!(db.outbox_len().unwrap(), 0);
     }
 

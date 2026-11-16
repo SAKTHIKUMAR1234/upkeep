@@ -55,6 +55,8 @@ const ADDED_CHECK_COLUMNS: &[(&str, &str)] = &[
     ("subject", "TEXT"),
     ("amount", "REAL"),
 ];
+/// The outbox holds Telegram HTML since this format version.
+const OUTBOX_FORMAT: (&str, &str) = ("outbox_format", "html");
 
 /// One check as `GET /monitor` shows it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -301,6 +303,26 @@ fn upgrade(connection: &Connection) -> rusqlite::Result<()> {
     if added.contains(&"streak_since") {
         connection.execute_batch("UPDATE checks SET streak_since = updated_at")?;
     }
+    escape_old_outbox(connection)
+}
+
+/// Messages queued by an older release are plain text: escapes them for parse_mode=HTML.
+fn escape_old_outbox(connection: &Connection) -> rusqlite::Result<()> {
+    let (name, format) = OUTBOX_FORMAT;
+    let current: Option<String> = connection
+        .query_row("SELECT value FROM meta WHERE name = ?1", [name], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if current.as_deref() != Some(format) {
+        connection.execute_batch(
+            "UPDATE outbox SET text = replace(replace(replace(text, '&', '&amp;'), '<', '&lt;'), '>', '&gt;')",
+        )?;
+        connection.execute(
+            "INSERT OR REPLACE INTO meta (name, value) VALUES (?1, ?2)",
+            [name, format],
+        )?;
+    }
     Ok(())
 }
 
@@ -350,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn an_old_database_gets_the_new_columns() {
+    fn an_old_database_gets_the_new_columns_and_escaped_outbox() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("monitor.db");
         let old = Connection::open(&path).unwrap();
@@ -358,7 +380,10 @@ mod tests {
             "CREATE TABLE checks (key TEXT PRIMARY KEY, level TEXT NOT NULL, since INTEGER NOT NULL, \
              streak INTEGER NOT NULL, last_sent_at INTEGER, notified INTEGER NOT NULL, \
              observed TEXT NOT NULL, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
-             INSERT INTO checks VALUES ('load', 'ok', 5, 0, NULL, 0, 'ok', '0.1', 9);",
+             INSERT INTO checks VALUES ('load', 'ok', 5, 0, NULL, 0, 'ok', '0.1', 9);
+             CREATE TABLE outbox (id INTEGER PRIMARY KEY, text TEXT NOT NULL, created_at INTEGER NOT NULL,
+             attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL, last_error TEXT);
+             INSERT INTO outbox (text, created_at, next_attempt_at) VALUES ('a <b> & c', 1, 1);",
         )
         .unwrap();
         drop(old);
@@ -369,6 +394,10 @@ mod tests {
             (row.state.rounds, row.state.streak_since, row.amount),
             (0, 9, None)
         );
+        assert_eq!(db.due(1).unwrap()[0].text, "a &lt;b&gt; &amp; c");
+        drop(db);
+        let again = MonitorDb::open(&path).unwrap();
+        assert_eq!(again.due(1).unwrap()[0].text, "a &lt;b&gt; &amp; c");
     }
 
     #[test]

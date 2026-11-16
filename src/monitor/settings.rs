@@ -10,6 +10,8 @@ use super::clock::{ClockTime, QuietHours, UtcOffset};
 #[serde(deny_unknown_fields, default)]
 pub struct MonitorSettings {
     pub enabled: bool,
+    /// Friendly server name for messages, such as "YRP server (.22)". The host name when absent.
+    pub display_name: Option<String>,
     #[serde(deserialize_with = "duration")]
     pub interval: Duration,
     /// Rounds in a row a check must show a new state before it is announced.
@@ -45,6 +47,7 @@ impl Default for MonitorSettings {
     fn default() -> Self {
         Self {
             enabled: true,
+            display_name: None,
             interval: Duration::from_secs(60),
             alert_after: 2,
             repeat_every: Duration::from_secs(6 * 3600),
@@ -62,6 +65,12 @@ impl Default for MonitorSettings {
             telegram: None,
             peers: Vec::new(),
         }
+    }
+}
+
+impl PeerSettings {
+    pub fn display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
     }
 }
 
@@ -108,6 +117,8 @@ fn default_api_url() -> String {
 #[serde(deny_unknown_fields)]
 pub struct PeerSettings {
     pub name: String,
+    /// Friendly server name for messages, such as "YRP server (.22)". The name when absent.
+    pub display_name: Option<String>,
     /// `http://<address>:<port>`, the peer's `listen` address.
     pub url: String,
     /// Owner-only file with the peer's API token.
@@ -134,6 +145,7 @@ mod tests {
         let settings: MonitorSettings = toml::from_str(
             r#"
             interval = "30s"
+            display_name = "YRP server (.22)"
             quiet_hours = "22:00-07:00"
             utc_offset = "+05:30"
             digest_at = "09:00"
@@ -152,6 +164,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(settings.interval, Duration::from_secs(30));
+        assert_eq!(settings.display_name.as_deref(), Some("YRP server (.22)"));
         assert_eq!(settings.alert_after, 2);
         assert_eq!(settings.disk, Limits::new(70.0, 85.0));
         assert_eq!(settings.inodes, Limits::new(80.0, 90.0));
@@ -163,6 +176,7 @@ mod tests {
         assert_eq!(telegram.api_url, "https://api.telegram.org");
         assert_eq!(telegram.message_thread_id, Some(42));
         assert_eq!(settings.peers[0].name, "erp");
+        assert_eq!(settings.peers[0].display_name(), "erp");
     }
 
     #[test]

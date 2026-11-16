@@ -67,6 +67,7 @@ async fn send_message(
     assert_eq!(bot_path, format!("bot{BOT_TOKEN}"));
     assert_eq!(body["chat_id"], "-1001");
     assert_eq!(body["message_thread_id"], 7);
+    assert_eq!(body["parse_mode"], "HTML");
     let text = body["text"].as_str().unwrap().to_owned();
     bot.texts.lock().unwrap().push(text);
     (StatusCode::OK, Json(json!({"ok": true, "result": {}})))
@@ -112,9 +113,15 @@ async fn a_disk_over_its_threshold_alerts_then_recovers() {
     harness.write_settings(&disk_settings(&harness, &api_url, 0.0, 0.0));
     harness.start().await;
 
-    let disk = format!("disk {}: ", harness.config_dir().display());
-    let alert = bot.expect(&harness, "CRITICAL · test-host\n", &disk).await;
-    assert!(alert.contains(" GB of "), "{alert}");
+    let disk = format!("<code>{}</code> has ", harness.config_dir().display());
+    let alert = bot
+        .expect(&harness, "<b>🔴 CRITICAL · test-host</b>\n<b>Disk ", &disk)
+        .await;
+    assert!(alert.contains("% full</b>\n"), "{alert}");
+    assert!(
+        alert.contains("\nSince ") && alert.contains(" · checked 2 times\n"),
+        "{alert}"
+    );
 
     let report = harness.client().get("/monitor").await.unwrap();
     let key = format!("disk:{}", harness.config_dir().display());
@@ -131,12 +138,15 @@ async fn a_disk_over_its_threshold_alerts_then_recovers() {
 
     // A raised threshold applies on the next round, without a restart.
     harness.write_settings(&disk_settings(&harness, &api_url, 99.99, 100.0));
-    let recovery = bot.expect(&harness, "RECOVERED · test-host\n", &disk).await;
-    assert!(recovery.contains("(was critical for"), "{recovery}");
+    let fixed = format!("Disk {} has space again", harness.config_dir().display());
+    let recovery = bot
+        .expect(&harness, "<b>✅ FIXED · test-host</b>\n", &fixed)
+        .await;
+    assert!(recovery.contains("\nLasted "), "{recovery}");
     let alerts = bot
         .texts()
         .iter()
-        .filter(|text| text.starts_with("CRITICAL"))
+        .filter(|text| text.starts_with("<b>🔴 CRITICAL"))
         .count();
     assert_eq!(alerts, 1, "one alert, not one per round: {:?}", bot.texts());
 }
@@ -149,15 +159,18 @@ async fn a_failing_ping_alerts_then_recovers() {
     let monitor = format!("disable = [\"disk\", {QUIET_KINDS}]");
     harness.write_settings(&monitor_settings(&harness, &api_url, &monitor, ""));
     harness.start().await;
-    let ping = "ping demo-app/demo-app answers: ";
-
     std::fs::write(harness.adapter_state("demo-app").join("broken"), "").unwrap();
-    bot.expect(&harness, "CRITICAL · test-host\n", ping).await;
+    bot.expect(
+        &harness,
+        "<b>🔴 CRITICAL · test-host</b>\n",
+        "<b>Site demo-app answers not answering</b>",
+    )
+    .await;
     std::fs::remove_file(harness.adapter_state("demo-app").join("broken")).unwrap();
     bot.expect(
         &harness,
-        "RECOVERED · test-host\n",
-        "ping demo-app/demo-app answers: up",
+        "<b>✅ FIXED · test-host</b>\n",
+        "<b>Site demo-app answers answers again</b>\nWas down for ",
     )
     .await;
 }
@@ -181,7 +194,7 @@ async fn alerts_wait_in_the_outbox_across_a_runner_restart() {
     bot.set_down(false);
     harness.start().await;
 
-    bot.expect(&harness, "CRITICAL · test-host\n", "disk ")
+    bot.expect(&harness, "<b>🔴 CRITICAL · test-host</b>\n", "<b>Disk ")
         .await;
 }
 
@@ -201,9 +214,10 @@ async fn a_dead_peer_runner_alerts_from_its_watcher_then_recovers() {
     let mut watcher = Harness::new();
     let peer_token = watcher.config_dir().join("peer-b.token");
     write_private(&peer_token, "peer-secret\n");
-    let monitor = format!("disable = [\"services\", \"disk\", {QUIET_KINDS}]");
+    let monitor =
+        format!("digest_at = \"00:00\"\ndisable = [\"services\", \"disk\", {QUIET_KINDS}]");
     let peers = format!(
-        "[[monitor.peer]]\nname = \"b\"\nurl = \"http://127.0.0.1:{peer_port}\"\ntoken_file = \"{}\"\n",
+        "[[monitor.peer]]\nname = \"b\"\ndisplay_name = \"Peer <b>\"\nurl = \"http://127.0.0.1:{peer_port}\"\ntoken_file = \"{}\"\n",
         peer_token.display()
     );
     watcher.write_settings(&monitor_settings(&watcher, &api_url, &monitor, &peers));
@@ -216,20 +230,38 @@ async fn a_dead_peer_runner_alerts_from_its_watcher_then_recovers() {
                 .then_some(())
         })
         .await;
-    assert!(bot.texts().is_empty(), "{:?}", bot.texts());
+    let summary = bot
+        .expect(
+            &watcher,
+            "<b>📊 Daily summary · ",
+            "<b>test-host</b> · ✅ all OK",
+        )
+        .await;
+    assert!(
+        summary.contains("\n\n<b>Peer &lt;b&gt;</b> · ✅ all OK\n0 checks OK"),
+        "{summary}"
+    );
+    assert_eq!(bot.texts().len(), 1, "{:?}", bot.texts());
 
     peer.kill();
     let down = bot
         .expect(
             &watcher,
-            "CRITICAL · test-host\n",
-            "runner b: down: Connection refused",
+            "<b>🚨 SERVER NOT ANSWERING · Peer &lt;b&gt;</b>\n",
+            "Error: Connection refused",
         )
         .await;
-    println!("{down}");
+    assert!(
+        down.contains("\ntest-host cannot reach Upkeep on Peer &lt;b&gt;.\n"),
+        "{down}"
+    );
     peer.start().await;
-    bot.expect(&watcher, "RECOVERED · test-host\n", "runner b: up")
-        .await;
+    bot.expect(
+        &watcher,
+        "<b>✅ FIXED · Peer &lt;b&gt;</b>\n",
+        "Seen from test-host.",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -252,7 +284,7 @@ async fn alert_test_and_status_all_from_the_cli() {
     );
     assert_eq!(
         bot.texts()[0].lines().take(2).collect::<Vec<_>>(),
-        ["Test alert · test-host", "Upkeep can reach this chat."]
+        ["<b>🧪 TEST · test-host</b>", "Upkeep can reach this chat."]
     );
 
     let client_dir = tempfile::tempdir().unwrap();

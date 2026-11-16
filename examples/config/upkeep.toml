@@ -10,12 +10,13 @@ launcher = "auto"
 # Check kinds: services (adapter services and pings), disk, inodes, memory, swap, load,
 # failed-units, reboot-required, security-updates, snapshot-age; and peer:<name>.
 # [monitor]
+# display_name = "Replica server (.11)"  # name in messages; the host name when absent
 # interval = "60s"
 # alert_after = 2            # rounds in a row before a new state is announced
 # repeat_every = "6h"        # send a still-bad check again after this time
 # utc_offset = "+05:30"      # local time for quiet hours, the digest and message times
 # quiet_hours = "22:00-07:00" # warn waits; critical always sends
-# digest_at = "09:00"
+# digest_at = "09:00"        # daily summary of this server and its peers; set it on one server only
 # disable = ["security-updates"]
 # disk_mounts = []           # empty: every mounted disk file system
 # disk = { warn = 80, critical = 90 }
@@ -32,5 +33,6 @@ launcher = "auto"
 #
 # [[monitor.peer]]           # another runner this one watches; "runner down" when it stops answering
 # name = "erp"
+# display_name = "ERP server (.22)"
 # url = "http://100.64.0.22:7878"
 # token_file = "/etc/upkeep/peers/erp.token"  # that runner's API token, chmod 600

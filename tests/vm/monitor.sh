@@ -91,7 +91,7 @@ use_b; boot_vm; install_upkeep "$config_b"
 log "1. both runners watch each other; alert test reaches the fake Telegram API"
 mark
 use_a; vm sudo upkeep alert test
-expect_message "Test alert · vm-a" "Upkeep can reach this chat."
+expect_message "<b>🧪 TEST · vm-a</b>" "Upkeep can reach this chat."
 use_a; wait_for "vm-a to see vm-b up" 60 check_is ok peer:vm-b
 use_b; wait_for "vm-b to see vm-a up" 60 check_is ok peer:vm-a
 vm sudo upkeep status
@@ -102,24 +102,24 @@ vm sudo systemctl reset-failed
 wait_for "no failed units on vm-a" 60 check_is ok failed-units
 mark
 vm 'sudo systemd-run --quiet --unit=upkeep-demo-broken /bin/false'
-expect_message "CRITICAL · vm-a" "upkeep-demo-broken.service"
+expect_message "<b>🔴 CRITICAL · vm-a</b>" "upkeep-demo-broken.service"
 vm sudo upkeep status | head -4
 vm sudo systemctl reset-failed upkeep-demo-broken.service
-expect_message "RECOVERED · vm-a" "failed-units: none"
+expect_message "<b>✅ FIXED · vm-a</b>" "No failed system services"
 
-log "3. vm-b's runner stops: vm-a raises runner down, then recovery"
+log "3. vm-b's runner stops: vm-a says it does not answer, then recovery"
 mark
 use_b; vm sudo systemctl stop upkeep
-expect_message "CRITICAL · vm-a" "runner vm-b: down"
+expect_message "<b>🚨 SERVER NOT ANSWERING · vm-b</b>" "vm-a cannot reach Upkeep on vm-b"
 use_b; vm sudo systemctl start upkeep
-expect_message "RECOVERED · vm-a" "runner vm-b: up"
+expect_message "<b>✅ FIXED · vm-b</b>" "Seen from vm-a"
 
-log "4. vm-a's runner stops: vm-b raises runner down, then recovery"
+log "4. vm-a's runner stops: vm-b says it does not answer, then recovery"
 mark
 use_a; vm sudo systemctl stop upkeep
-expect_message "CRITICAL · vm-b" "runner vm-a: down"
+expect_message "<b>🚨 SERVER NOT ANSWERING · vm-a</b>" "vm-b cannot reach Upkeep on vm-a"
 use_a; vm sudo systemctl start upkeep
-expect_message "RECOVERED · vm-b" "runner vm-a: up"
+expect_message "<b>✅ FIXED · vm-a</b>" "Seen from vm-b"
 
 log "all VM checks passed; every message the fake Telegram API got:"
 python3 -c 'import json,sys; [print("  " + json.loads(l)["text"].replace("\n", " | ")) for l in open(sys.argv[1])]' "$messages"

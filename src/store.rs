@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::plan::{JobPlan, StepSpec};
@@ -143,6 +143,14 @@ pub struct Step {
     pub finished_at: Option<i64>,
 }
 
+/// The newest package check: packages to update and how many of them are risky.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateCheck {
+    pub packages: u64,
+    pub risky: u64,
+    pub checked_at: i64,
+}
+
 /// How a step ended.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StepOutcome {
@@ -264,6 +272,28 @@ impl Store {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// The newest successful `check_updates` step that lists `upgrades`.
+    pub fn last_update_check(&self) -> Result<Option<UpdateCheck>, StoreError> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT json_array_length(result, '$.upgrades'), \
+                 COALESCE(json_array_length(result, '$.risky'), 0), finished_at FROM steps \
+                 WHERE action = 'check_updates' AND status = 'ok' \
+                 AND json_type(result, '$.upgrades') = 'array' \
+                 ORDER BY finished_at DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(UpdateCheck {
+                        packages: row.get(0)?,
+                        risky: row.get(1)?,
+                        checked_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn mark_step_running(&self, step: &Step) -> Result<(), StoreError> {
@@ -525,6 +555,33 @@ mod tests {
             statuses,
             [StepStatus::Failed, StepStatus::Skipped, StepStatus::Pending]
         );
+    }
+
+    #[test]
+    fn the_newest_package_check_counts_updates_and_risky_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        assert_eq!(store.last_update_check().unwrap(), None);
+
+        let check = |result: Value| {
+            let mut job = plan("check");
+            job.steps[0].action = "check_updates".into();
+            let id = store.create_job(&job, "test", None).unwrap();
+            let step = store.next_step(id, Phase::Main).unwrap().unwrap();
+            let outcome = StepOutcome {
+                status: StepStatus::Ok,
+                exit_code: Some(0),
+                result: Some(result),
+                error: None,
+            };
+            store.finish_step(&step, &outcome, "boot").unwrap();
+            store.finish_job(id, JobStatus::Succeeded, None).unwrap();
+        };
+        check(serde_json::json!({"upgrades": [{}, {}, {}], "risky": ["linux-image"]}));
+        check(serde_json::json!({"apps": ["hrms"]}));
+
+        let found = store.last_update_check().unwrap().unwrap();
+        assert_eq!((found.packages, found.risky), (3, 1));
     }
 
     #[test]

@@ -23,7 +23,8 @@ use crate::time::now_unix;
 use checks::host::{self, SecurityUpdates};
 use checks::{Observation, system};
 use db::MonitorDb;
-use message::Letterhead;
+use message::digest::{HostReport, Section};
+use message::{Event, Letterhead};
 use settings::MonitorSettings;
 use state::{CheckState, Policy};
 use telegram::Telegram;
@@ -163,18 +164,28 @@ impl Monitor {
         let letterhead = self.letterhead(settings);
 
         let mut states = self.db.states()?;
-        let mut messages = Vec::new();
+        let mut notices = Vec::new();
         let mut round = Vec::new();
         for observation in observations {
             let mut state = states
                 .remove(&observation.key)
                 .unwrap_or_else(|| CheckState::new(now));
-            if let Some(notice) = state.advance(observation.level, now, quiet, policy) {
-                messages.push(letterhead.notice(&notice, &observation, now));
-            }
+            notices.push(state.advance(observation.level, now, quiet, policy));
             round.push((observation, state));
         }
-        if let Some(digest) = self.due_digest(settings, &round, now)? {
+        let events: Vec<Event> = round
+            .iter()
+            .zip(&notices)
+            .filter_map(|((observation, state), notice)| {
+                Some(Event {
+                    notice: notice.as_ref()?,
+                    observation,
+                    state,
+                })
+            })
+            .collect();
+        let mut messages = letterhead.round(&events, now);
+        if let Some(digest) = self.due_digest(settings, &round, now).await? {
             messages.push(digest);
         }
 
@@ -229,7 +240,8 @@ impl Monitor {
         Ok(one_per_key(observations))
     }
 
-    fn due_digest(
+    /// The daily summary of this server and its peers, once a day after `digest_at`.
+    async fn due_digest(
         &self,
         settings: &MonitorSettings,
         round: &[(Observation, CheckState)],
@@ -245,17 +257,30 @@ impl Monitor {
             return Ok(None);
         }
         self.db.set_meta(DIGEST_DAY, &today)?;
-        let checks: Vec<_> = round
-            .iter()
-            .map(|(observation, state)| (state.level, observation))
-            .collect();
-        Ok(Some(self.letterhead(settings).digest(&checks, now)))
+        let letterhead = self.letterhead(settings);
+        let mut sections = vec![Section::Host(HostReport {
+            name: letterhead.host.clone(),
+            checks: round.to_vec(),
+            updates: self.runner.store().last_update_check()?,
+        })];
+        for peer in &settings.peers {
+            sections.push(peers::section(peer).await);
+        }
+        Ok(Some(letterhead.digest(&sections, now)))
+    }
+
+    fn display_name(&self, settings: &MonitorSettings) -> String {
+        settings
+            .display_name
+            .clone()
+            .unwrap_or_else(|| self.host.clone())
     }
 
     fn letterhead(&self, settings: &MonitorSettings) -> Letterhead {
         Letterhead {
-            host: self.host.clone(),
+            host: self.display_name(settings),
             offset: settings.utc_offset,
+            repeat_every: settings.repeat_every.as_secs() as i64,
         }
     }
 
@@ -263,7 +288,7 @@ impl Monitor {
     pub async fn send_test(&self) -> Result<(), MonitorError> {
         let active = self.active();
         let telegram = active.telegram.as_ref().ok_or(MonitorError::NoTelegram)?;
-        let text = self.letterhead(&active.settings).test(now_unix());
+        let text = self.letterhead(&active.settings).test();
         Ok(telegram.send(&text).await?)
     }
 
@@ -273,6 +298,8 @@ impl Monitor {
         let checks = self.db.checks()?;
         Ok(json!({
             "host": self.host,
+            "display_name": self.display_name(&active.settings),
+            "updates": self.runner.store().last_update_check()?,
             "enabled": active.settings.enabled,
             "interval_secs": active.settings.interval.as_secs(),
             "telegram": active.telegram.is_some(),
