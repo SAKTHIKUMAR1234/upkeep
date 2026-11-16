@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use upkeep::monitor::checks::{Level, Observation};
 use upkeep::monitor::message::digest::{HostReport, Section};
@@ -193,7 +194,7 @@ fn samples(now: i64) -> Vec<String> {
 
     let pending = [StepStatus::Pending; 6];
     let running = job(JobStatus::Running, now, None, None);
-    messages.push(replica.job_started(&running, &steps(&pending)));
+    messages.push(replica.job_started(&running, &steps(&pending), Duration::from_secs(300)));
 
     let done = job(JobStatus::Succeeded, now - 18 * MINUTE, Some(now), None);
     messages.push(replica.job_finished(&done, &steps(&[StepStatus::Ok; 6]), now));

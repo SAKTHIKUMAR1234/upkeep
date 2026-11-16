@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::{Letterhead, count, escape, header, span};
 use crate::store::{Job, JobStatus, Phase, Step, StepStatus};
 
@@ -5,8 +7,8 @@ use crate::store::{Job, JobStatus, Phase, Step, StepStatus};
 const LISTED_STEPS: usize = 8;
 
 impl Letterhead {
-    /// For example "🛠️ UPDATE STARTED", the plan, who started it and its steps.
-    pub fn job_started(&self, job: &Job, steps: &[Step]) -> String {
+    /// For example "🛠️ UPDATE STARTED", the plan, who started it, its steps and the alert pause.
+    pub fn job_started(&self, job: &Job, steps: &[Step], job_grace: Duration) -> String {
         let main: Vec<&Step> = main_steps(steps).collect();
         let mut names: Vec<String> = main
             .iter()
@@ -24,6 +26,10 @@ impl Letterhead {
                 escape(&job.requested_by)
             ),
             format!("{}: {}", count(main.len(), "step"), names.join(", ")),
+            format!(
+                "Alerts for this server are paused during the job and for {} after it.",
+                span(job_grace.as_secs() as i64)
+            ),
         ]
         .join("\n")
     }
@@ -194,10 +200,15 @@ mod tests {
             ),
         ];
         assert_eq!(
-            letterhead().job_started(&job(JobStatus::Running, None), &steps),
+            letterhead().job_started(
+                &job(JobStatus::Running, None),
+                &steps,
+                Duration::from_secs(300)
+            ),
             "<b>🛠️ UPDATE STARTED · YRP server (.22)</b>\n\
              Plan: <b>os-update</b> · started by Sakthi &lt;ops&gt;\n\
-             2 steps: <code>app:maintenance_on</code>, <code>os:update</code>"
+             2 steps: <code>app:maintenance_on</code>, <code>os:update</code>\n\
+             Alerts for this server are paused during the job and for 5 minutes after it."
         );
     }
 

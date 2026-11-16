@@ -28,7 +28,7 @@ use db::MonitorDb;
 use message::digest::{HostReport, Section};
 use message::{Event, Letterhead};
 use settings::MonitorSettings;
-use state::{CheckState, Policy};
+use state::{CheckState, Hold, Policy};
 use telegram::Telegram;
 
 const DELIVERY_TICK: Duration = Duration::from_secs(5);
@@ -187,7 +187,7 @@ impl Monitor {
         let letterhead = self.letterhead(&active.settings);
         let now = now_unix();
         let text = if started {
-            letterhead.job_started(&job, &steps)
+            letterhead.job_started(&job, &steps, active.settings.job_grace)
         } else {
             letterhead.job_finished(&job, &steps, now)
         };
@@ -200,12 +200,11 @@ impl Monitor {
     async fn round(&self, active: &Active, now: i64) -> Result<(), MonitorError> {
         let settings = &active.settings;
         let observations = self.observe(settings, now).await?;
-        let quiet = settings
-            .quiet_hours
-            .is_some_and(|hours| hours.contains(settings.utc_offset.minute_of_day(now)));
-        let policy = Policy {
-            alert_after: settings.alert_after,
-            repeat_every: settings.repeat_every.as_secs() as i64,
+        let rules = RoundRules {
+            quiet: settings
+                .quiet_hours
+                .is_some_and(|hours| hours.contains(settings.utc_offset.minute_of_day(now))),
+            in_job: self.is_in_job(settings, now)?,
         };
         let letterhead = self.letterhead(settings);
 
@@ -216,7 +215,8 @@ impl Monitor {
             let mut state = states
                 .remove(&observation.key)
                 .unwrap_or_else(|| CheckState::new(now));
-            notices.push(state.advance(observation.level, now, quiet, policy));
+            let (hold, policy) = rules.for_check(settings, &observation);
+            notices.push(state.advance(observation.level, now, hold, policy));
             round.push((observation, state));
         }
         let events: Vec<Event> = round
@@ -245,6 +245,18 @@ impl Monitor {
         Ok(())
     }
 
+    /// True while a job runs, including one that waits for a reboot, and for `job_grace` after the last one ended.
+    fn is_in_job(&self, settings: &MonitorSettings, now: i64) -> Result<bool, MonitorError> {
+        let store = self.runner.store();
+        if store.active_job()?.is_some() {
+            return Ok(true);
+        }
+        let grace = settings.job_grace.as_secs() as i64;
+        Ok(store
+            .last_job_finished_at()?
+            .is_some_and(|finished_at| now - finished_at < grace))
+    }
+
     /// Every check of this round, one per key; the worst wins when two share a key.
     async fn observe(
         &self,
@@ -262,7 +274,10 @@ impl Monitor {
         };
         let (mut observations, failed_units, security, peers, system) = tokio::join!(
             services,
-            when(settings.is_enabled("failed-units"), host::failed_units()),
+            when(
+                settings.is_enabled("failed-units"),
+                host::failed_units(&settings.ignore_failed_units)
+            ),
             when(
                 settings.is_enabled("security-updates"),
                 self.security.observe()
@@ -355,6 +370,34 @@ impl Monitor {
     }
 }
 
+/// What decides the messages of one round.
+#[derive(Clone, Copy, Debug)]
+struct RoundRules {
+    quiet: bool,
+    /// A job runs on this server or has just ended.
+    in_job: bool,
+}
+
+impl RoundRules {
+    /// A job holds every message of this server's own checks; peers keep alerting after their `down_after`.
+    fn for_check(self, settings: &MonitorSettings, observation: &Observation) -> (Hold, Policy) {
+        let peer = settings.peer(&observation.key);
+        let hold = if self.in_job && peer.is_none() {
+            Hold::All
+        } else if self.quiet {
+            Hold::Warn
+        } else {
+            Hold::Nothing
+        };
+        let policy = Policy {
+            alert_after: settings.alert_after,
+            repeat_every: settings.repeat_every.as_secs() as i64,
+            bad_after: peer.map_or(0, |peer| peer.down_after.as_secs() as i64),
+        };
+        (hold, policy)
+    }
+}
+
 /// Keeps the worst observation per key, sorted by key.
 fn one_per_key(observations: impl IntoIterator<Item = Observation>) -> Vec<Observation> {
     let mut by_key: BTreeMap<String, Observation> = BTreeMap::new();
@@ -371,4 +414,34 @@ fn one_per_key(observations: impl IntoIterator<Item = Observation>) -> Vec<Obser
 
 async fn when<T>(enabled: bool, check: impl Future<Output = T>) -> Option<T> {
     if enabled { Some(check.await) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use checks::Level;
+
+    #[test]
+    fn a_job_holds_own_checks_but_not_peers() {
+        let settings: MonitorSettings = toml::from_str(
+            "[[peer]]\nname = \"erp\"\nurl = \"http://127.0.0.1:7878\"\ntoken_file = \"/t\"\n",
+        )
+        .unwrap();
+        let disk = Observation::new("disk:/", Level::Critical, "95% used");
+        let peer = Observation::new("peer:erp", Level::Critical, "down");
+        let in_job = RoundRules {
+            quiet: true,
+            in_job: true,
+        };
+
+        let (hold, policy) = in_job.for_check(&settings, &disk);
+        assert_eq!((hold, policy.bad_after), (Hold::All, 0));
+        let (hold, policy) = in_job.for_check(&settings, &peer);
+        assert_eq!((hold, policy.bad_after), (Hold::Warn, 600));
+        let idle = RoundRules {
+            quiet: false,
+            in_job: false,
+        };
+        assert_eq!(idle.for_check(&settings, &disk).0, Hold::Nothing);
+    }
 }

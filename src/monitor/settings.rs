@@ -27,6 +27,11 @@ pub struct MonitorSettings {
     pub digest_at: Option<ClockTime>,
     /// Check kinds to skip, for example ["security-updates", "swap"].
     pub disable: Vec<String>,
+    /// After a job ends, this server's alerts wait this long, so services it stopped can start again.
+    #[serde(deserialize_with = "duration")]
+    pub job_grace: Duration,
+    /// Unit name patterns, such as "fwupd-*", that the failed-units check does not count.
+    pub ignore_failed_units: Vec<String>,
     /// Mount points to check. Empty means every mounted disk file system.
     pub disk_mounts: Vec<PathBuf>,
     pub disk: Limits,
@@ -55,6 +60,8 @@ impl Default for MonitorSettings {
             quiet_hours: None,
             digest_at: None,
             disable: Vec::new(),
+            job_grace: Duration::from_secs(5 * 60),
+            ignore_failed_units: Vec::new(),
             disk_mounts: Vec::new(),
             disk: Limits::new(80.0, 90.0),
             inodes: Limits::new(80.0, 90.0),
@@ -77,6 +84,12 @@ impl PeerSettings {
 impl MonitorSettings {
     pub fn is_enabled(&self, kind: &str) -> bool {
         !self.disable.iter().any(|disabled| disabled == kind)
+    }
+
+    /// The peer of a `peer:<name>` check key.
+    pub fn peer(&self, key: &str) -> Option<&PeerSettings> {
+        let name = key.strip_prefix("peer:")?;
+        self.peers.iter().find(|peer| peer.name == name)
     }
 }
 
@@ -123,6 +136,13 @@ pub struct PeerSettings {
     pub url: String,
     /// Owner-only file with the peer's API token.
     pub token_file: PathBuf,
+    /// How long the peer must not answer before it is announced, so a reboot does not alert.
+    #[serde(default = "default_down_after", deserialize_with = "duration")]
+    pub down_after: Duration,
+}
+
+fn default_down_after() -> Duration {
+    Duration::from_secs(10 * 60)
 }
 
 fn duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
@@ -150,6 +170,8 @@ mod tests {
             utc_offset = "+05:30"
             digest_at = "09:00"
             snapshot_max_age = "26h"
+            job_grace = "2m"
+            ignore_failed_units = ["systemd-networkd-wait-online.service"]
             disk = { warn = 70, critical = 85 }
             [telegram]
             token_file = "/etc/upkeep/telegram-token"
@@ -159,6 +181,11 @@ mod tests {
             name = "erp"
             url = "http://100.64.0.22:7878"
             token_file = "/etc/upkeep/peers/erp.token"
+            [[peer]]
+            name = "replica"
+            url = "http://100.64.0.11:7878"
+            token_file = "/etc/upkeep/peers/replica.token"
+            down_after = "15m"
             "#,
         )
         .unwrap();
@@ -172,11 +199,26 @@ mod tests {
             settings.snapshot_max_age,
             Some(Duration::from_secs(26 * 3600))
         );
-        let telegram = settings.telegram.unwrap();
+        let telegram = settings.telegram.as_ref().unwrap();
         assert_eq!(telegram.api_url, "https://api.telegram.org");
         assert_eq!(telegram.message_thread_id, Some(42));
         assert_eq!(settings.peers[0].name, "erp");
         assert_eq!(settings.peers[0].display_name(), "erp");
+        assert_eq!(settings.job_grace, Duration::from_secs(120));
+        assert_eq!(
+            settings.ignore_failed_units,
+            ["systemd-networkd-wait-online.service"]
+        );
+        assert_eq!(settings.peers[0].down_after, Duration::from_secs(600));
+        assert_eq!(
+            settings.peer("peer:replica").unwrap().down_after,
+            Duration::from_secs(900)
+        );
+        assert!(settings.peer("peer:gone").is_none() && settings.peer("disk:/").is_none());
+        assert_eq!(
+            MonitorSettings::default().job_grace,
+            Duration::from_secs(300)
+        );
     }
 
     #[test]

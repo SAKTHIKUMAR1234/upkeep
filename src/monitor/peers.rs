@@ -93,6 +93,7 @@ mod tests {
             display_name: None,
             url: format!("http://127.0.0.1:{port}"),
             token_file,
+            down_after: Duration::from_secs(600),
         }
     }
 

@@ -28,8 +28,8 @@ pub fn adapter_health(report: &HealthReport) -> Vec<Observation> {
     items.chain(errors).collect()
 }
 
-/// Critical while any systemd unit is in the failed state.
-pub async fn failed_units() -> Observation {
+/// Critical while any systemd unit not matched by an `ignore` pattern is in the failed state.
+pub async fn failed_units(ignore: &[String]) -> Observation {
     let mut command = health::command(
         "systemctl",
         &[
@@ -41,17 +41,18 @@ pub async fn failed_units() -> Observation {
         ],
     );
     match health::run(&mut command, COMMAND_TIMEOUT).await {
-        Ok(output) => parse_failed_units(&output),
+        Ok(output) => parse_failed_units(&output, ignore),
         Err(error) => {
             Observation::new("failed-units", Level::Warn, format!("cannot list: {error}"))
         }
     }
 }
 
-pub fn parse_failed_units(output: &str) -> Observation {
+pub fn parse_failed_units(output: &str, ignore: &[String]) -> Observation {
     let units: Vec<&str> = output
         .lines()
         .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| !ignore.iter().any(|pattern| matches_glob(pattern, unit)))
         .collect();
     if units.is_empty() {
         return Observation::new("failed-units", Level::Ok, "none");
@@ -63,6 +64,28 @@ pub fn parse_failed_units(output: &str) -> Observation {
     )
     .with_subject(units.join(", "))
     .with_amount(units.len() as f64)
+}
+
+/// Shell-style match: `*` is any text, `?` is one character, the rest must be equal.
+pub fn matches_glob(pattern: &str, text: &str) -> bool {
+    let mut pattern_chars = pattern.chars();
+    match pattern_chars.next() {
+        None => text.is_empty(),
+        Some('*') => {
+            let rest = pattern_chars.as_str();
+            text.char_indices()
+                .map(|(at, _)| at)
+                .chain([text.len()])
+                .any(|at| matches_glob(rest, &text[at..]))
+        }
+        Some(wanted) => {
+            let mut text_chars = text.chars();
+            text_chars
+                .next()
+                .is_some_and(|found| wanted == '?' || wanted == found)
+                && matches_glob(pattern_chars.as_str(), text_chars.as_str())
+        }
+    }
 }
 
 pub fn reboot_required(flag: &Path) -> Observation {
@@ -169,14 +192,37 @@ mod tests {
     fn failed_units_are_listed() {
         let output = "motd-news.service    loaded failed failed Message of the Day\n\
                       fwupd-refresh.service loaded failed failed Refresh fwupd metadata\n";
-        let observation = parse_failed_units(output);
+        let observation = parse_failed_units(output, &[]);
         assert_eq!(observation.level, Level::Critical);
         assert_eq!(
             observation.value,
             "2 failed: motd-news.service, fwupd-refresh.service"
         );
         assert_eq!(observation.amount, Some(2.0));
-        assert_eq!(parse_failed_units("").level, Level::Ok);
+        assert_eq!(parse_failed_units("", &[]).level, Level::Ok);
+    }
+
+    #[test]
+    fn ignored_failed_units_do_not_count() {
+        let output = "systemd-networkd-wait-online.service loaded failed failed Wait\n\
+                      fwupd-refresh.service loaded failed failed Refresh fwupd metadata\n";
+        let ignore = ["systemd-networkd-wait-online.service".to_owned()];
+        let observation = parse_failed_units(output, &ignore);
+        assert_eq!(observation.value, "1 failed: fwupd-refresh.service");
+        let all = ["*wait-online*".to_owned(), "fwupd-?efresh.*".to_owned()];
+        assert_eq!(parse_failed_units(output, &all).level, Level::Ok);
+    }
+
+    #[test]
+    fn globs_match_like_the_shell() {
+        assert!(matches_glob("fwupd-*", "fwupd-refresh.service"));
+        assert!(matches_glob("*.service", "a.service"));
+        assert!(matches_glob("a*b*c", "aXbYbZc"));
+        assert!(matches_glob("unit?.timer", "unit1.timer"));
+        assert!(matches_glob("*", ""));
+        assert!(!matches_glob("fwupd-*", "motd-news.service"));
+        assert!(!matches_glob("a*b", "acbd"));
+        assert!(!matches_glob("unit?.timer", "unit.timer"));
     }
 
     #[test]

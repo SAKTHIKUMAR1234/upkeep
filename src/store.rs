@@ -265,6 +265,13 @@ impl Store {
             .optional()?)
     }
 
+    /// When the newest finished job ended.
+    pub fn last_job_finished_at(&self) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .lock()
+            .query_row("SELECT MAX(finished_at) FROM jobs", [], |row| row.get(0))?)
+    }
+
     /// When the newest successful `snapshot` step finished.
     pub fn last_snapshot_at(&self) -> Result<Option<i64>, StoreError> {
         Ok(self.lock().query_row(
@@ -516,6 +523,19 @@ mod tests {
 
         store.finish_job(first, JobStatus::Succeeded, None).unwrap();
         assert!(store.create_job(&plan("three"), "test", None).is_ok());
+    }
+
+    #[test]
+    fn knows_when_the_last_job_ended() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db")).unwrap();
+        assert_eq!(store.last_job_finished_at().unwrap(), None);
+
+        let id = store.create_job(&plan("one"), "test", None).unwrap();
+        assert_eq!(store.last_job_finished_at().unwrap(), None);
+        store.finish_job(id, JobStatus::Failed, None).unwrap();
+        let finished_at = store.last_job_finished_at().unwrap().unwrap();
+        assert!((now_unix() - finished_at).abs() <= 1);
     }
 
     #[test]

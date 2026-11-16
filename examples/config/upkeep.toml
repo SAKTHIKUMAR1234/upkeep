@@ -18,6 +18,8 @@ launcher = "auto"
 # quiet_hours = "22:00-07:00" # warn waits; critical always sends
 # digest_at = "09:00"        # daily summary of this server and its peers; set it on one server only
 # disable = ["security-updates"]
+# job_grace = "5m"           # no alerts for this server while a job runs and this long after it ends
+# ignore_failed_units = ["systemd-networkd-wait-online.service"]  # failed-units skips these; * and ? match like the shell
 # disk_mounts = []           # empty: every mounted disk file system
 # disk = { warn = 80, critical = 90 }
 # inodes = { warn = 80, critical = 90 }
@@ -36,3 +38,4 @@ launcher = "auto"
 # display_name = "ERP server (.22)"
 # url = "http://100.64.0.22:7878"
 # token_file = "/etc/upkeep/peers/erp.token"  # that runner's API token, chmod 600
+# down_after = "10m"         # alert only when it has not answered this long, so a reboot does not alert

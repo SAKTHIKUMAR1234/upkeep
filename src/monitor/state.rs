@@ -9,6 +9,18 @@ pub struct Policy {
     pub alert_after: u32,
     /// Seconds after which a still-bad check is sent again.
     pub repeat_every: i64,
+    /// Seconds a new bad level must last before it counts, on top of `alert_after`.
+    pub bad_after: i64,
+}
+
+/// The messages a round holds back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    Nothing,
+    /// Quiet hours: warn messages wait.
+    Warn,
+    /// A job runs or has just ended: nothing is sent, and a check still bad afterwards is sent as new.
+    All,
 }
 
 /// What the runner remembers about one check between rounds.
@@ -61,13 +73,12 @@ impl CheckState {
         }
     }
 
-    /// Applies one round's level and returns the message to send, if any.
-    /// In quiet hours warn messages wait; critical and recovery messages always go out.
+    /// Applies one round's level and returns the message to send, if any. `hold` says which messages wait.
     pub fn advance(
         &mut self,
         observed: Level,
         now: i64,
-        quiet: bool,
+        hold: Hold,
         policy: Policy,
     ) -> Option<Notice> {
         if observed == self.level {
@@ -78,7 +89,7 @@ impl CheckState {
                 self.streak_since = now;
             }
             self.streak += 1;
-            if self.streak >= policy.alert_after.max(1) {
+            if self.is_settled(observed, now, policy) {
                 let was = self.level;
                 let was_since = self.since;
                 self.level = observed;
@@ -88,7 +99,7 @@ impl CheckState {
                 self.last_sent_at = None;
                 if observed == Level::Ok {
                     let notified = std::mem::take(&mut self.notified);
-                    return notified.then_some(Notice::Recovery {
+                    return (notified && hold != Hold::All).then_some(Notice::Recovery {
                         was,
                         since: was_since,
                         until: self.since,
@@ -96,11 +107,22 @@ impl CheckState {
                 }
             }
         }
-        self.due_alert(now, quiet, policy)
+        self.due_alert(now, hold, policy)
     }
 
-    fn due_alert(&mut self, now: i64, quiet: bool, policy: Policy) -> Option<Notice> {
-        if !self.level.is_bad() || (quiet && self.level == Level::Warn) {
+    /// The current streak has lasted long enough to replace the settled level.
+    fn is_settled(&self, observed: Level, now: i64, policy: Policy) -> bool {
+        self.streak >= policy.alert_after.max(1)
+            && (!observed.is_bad() || now - self.streak_since >= policy.bad_after)
+    }
+
+    fn due_alert(&mut self, now: i64, hold: Hold, policy: Policy) -> Option<Notice> {
+        let held = match hold {
+            Hold::Nothing => false,
+            Hold::Warn => self.level == Level::Warn,
+            Hold::All => true,
+        };
+        if !self.level.is_bad() || held {
             return None;
         }
         let repeat = match self.last_sent_at {
@@ -124,6 +146,7 @@ mod tests {
     const POLICY: Policy = Policy {
         alert_after: 2,
         repeat_every: 6 * 3600,
+        bad_after: 0,
     };
 
     /// Feeds one level per minute and returns the notices.
@@ -131,12 +154,12 @@ mod tests {
         state: &mut CheckState,
         start: i64,
         levels: &[Level],
-        quiet: bool,
+        hold: Hold,
     ) -> Vec<Option<Notice>> {
         levels
             .iter()
             .enumerate()
-            .map(|(round, level)| state.advance(*level, start + round as i64 * 60, quiet, POLICY))
+            .map(|(round, level)| state.advance(*level, start + round as i64 * 60, hold, POLICY))
             .collect()
     }
 
@@ -154,7 +177,7 @@ mod tests {
             &mut state,
             0,
             &[Level::Critical, Level::Ok, Level::Critical, Level::Ok],
-            false,
+            Hold::Nothing,
         );
         assert!(notices.iter().all(Option::is_none));
         assert_eq!(state.level, Level::Ok);
@@ -170,7 +193,7 @@ mod tests {
             Level::Ok,
             Level::Ok,
         ];
-        let notices = run(&mut state, 0, &levels, false);
+        let notices = run(&mut state, 0, &levels, Hold::Nothing);
         assert_eq!(
             notices,
             [
@@ -191,7 +214,7 @@ mod tests {
     #[test]
     fn rounds_count_every_round_of_the_settled_level() {
         let mut state = CheckState::new(0);
-        run(&mut state, 0, &[Level::Warn; 5], false);
+        run(&mut state, 0, &[Level::Warn; 5], Hold::Nothing);
         assert_eq!(
             (state.level, state.since, state.rounds),
             (Level::Warn, 0, 5)
@@ -201,20 +224,30 @@ mod tests {
     #[test]
     fn flapping_between_warn_and_critical_still_alerts() {
         let mut state = CheckState::new(0);
-        let notices = run(&mut state, 0, &[Level::Warn, Level::Critical], false);
+        let notices = run(
+            &mut state,
+            0,
+            &[Level::Warn, Level::Critical],
+            Hold::Nothing,
+        );
         assert_eq!(notices, [None, alert(Level::Critical)]);
     }
 
     #[test]
     fn a_still_bad_check_repeats_after_the_repeat_time() {
         let mut state = CheckState::new(0);
-        run(&mut state, 0, &[Level::Critical, Level::Critical], false);
+        run(
+            &mut state,
+            0,
+            &[Level::Critical, Level::Critical],
+            Hold::Nothing,
+        );
         assert_eq!(
-            state.advance(Level::Critical, 60 + 6 * 3600 - 1, false, POLICY),
+            state.advance(Level::Critical, 60 + 6 * 3600 - 1, Hold::Nothing, POLICY),
             None
         );
         assert_eq!(
-            state.advance(Level::Critical, 60 + 6 * 3600, false, POLICY),
+            state.advance(Level::Critical, 60 + 6 * 3600, Hold::Nothing, POLICY),
             Some(Notice::Alert {
                 level: Level::Critical,
                 repeat: true
@@ -226,7 +259,7 @@ mod tests {
     fn escalation_is_a_new_alert() {
         let mut state = CheckState::new(0);
         let levels = [Level::Warn, Level::Warn, Level::Critical, Level::Critical];
-        let notices = run(&mut state, 0, &levels, false);
+        let notices = run(&mut state, 0, &levels, Hold::Nothing);
         assert_eq!(
             notices,
             [None, alert(Level::Warn), None, alert(Level::Critical)]
@@ -241,12 +274,12 @@ mod tests {
                 &mut state,
                 0,
                 &[Level::Warn, Level::Warn, Level::Warn],
-                true
+                Hold::Warn
             ),
             [None, None, None]
         );
         assert_eq!(
-            state.advance(Level::Warn, 600, false, POLICY),
+            state.advance(Level::Warn, 600, Hold::Nothing, POLICY),
             alert(Level::Warn)
         );
     }
@@ -254,7 +287,12 @@ mod tests {
     #[test]
     fn quiet_hours_never_hold_critical() {
         let mut state = CheckState::new(0);
-        let notices = run(&mut state, 0, &[Level::Critical, Level::Critical], true);
+        let notices = run(
+            &mut state,
+            0,
+            &[Level::Critical, Level::Critical],
+            Hold::Warn,
+        );
         assert_eq!(notices, [None, alert(Level::Critical)]);
     }
 
@@ -263,10 +301,57 @@ mod tests {
         let mut state = CheckState::new(0);
         let levels = [Level::Warn, Level::Warn, Level::Ok, Level::Ok];
         assert!(
-            run(&mut state, 0, &levels, true)
+            run(&mut state, 0, &levels, Hold::Warn)
                 .iter()
                 .all(Option::is_none)
         );
         assert!(!state.notified);
+    }
+
+    #[test]
+    fn a_job_holds_every_message_and_a_still_bad_check_alerts_as_new_after_it() {
+        let mut state = CheckState::new(0);
+        let held = run(&mut state, 0, &[Level::Critical; 3], Hold::All);
+        assert_eq!(held, [None, None, None]);
+        assert_eq!((state.level, state.notified), (Level::Critical, false));
+        assert_eq!(
+            state.advance(Level::Critical, 180, Hold::Nothing, POLICY),
+            alert(Level::Critical)
+        );
+    }
+
+    #[test]
+    fn a_job_holds_the_recovery_of_an_announced_check() {
+        let mut state = CheckState::new(0);
+        run(&mut state, 0, &[Level::Critical; 2], Hold::Nothing);
+        assert!(state.notified);
+        let held = run(&mut state, 120, &[Level::Ok; 2], Hold::All);
+        assert_eq!(held, [None, None]);
+        assert_eq!((state.level, state.notified), (Level::Ok, false));
+    }
+
+    #[test]
+    fn a_bad_level_waits_for_bad_after_but_recovery_does_not() {
+        let policy = Policy {
+            bad_after: 600,
+            ..POLICY
+        };
+        let mut state = CheckState::new(0);
+        for minute in 0..10 {
+            assert_eq!(
+                state.advance(Level::Critical, minute * 60, Hold::Nothing, policy),
+                None
+            );
+        }
+        assert_eq!(
+            state.advance(Level::Critical, 600, Hold::Nothing, policy),
+            alert(Level::Critical)
+        );
+        assert_eq!(state.since, 0);
+        state.advance(Level::Ok, 660, Hold::Nothing, policy);
+        assert!(matches!(
+            state.advance(Level::Ok, 720, Hold::Nothing, policy),
+            Some(Notice::Recovery { .. })
+        ));
     }
 }

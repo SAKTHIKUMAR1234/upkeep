@@ -42,6 +42,7 @@ api_url = "http://10.0.2.2:$bot_port"
 name = "$2"
 url = "http://10.0.2.2:$3"
 token_file = "/etc/upkeep/peer.token"
+down_after = "10s"
 TOML
   echo "$dir"
 }

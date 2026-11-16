@@ -99,7 +99,7 @@ fn monitor_settings(harness: &Harness, api_url: &str, monitor: &str, tail: &str)
 
 fn disk_settings(harness: &Harness, api_url: &str, warn: f64, critical: f64) -> String {
     let monitor = format!(
-        "disable = [\"services\", {QUIET_KINDS}]\ndisk_mounts = [\"{}\"]\ndisk = {{ warn = {warn:?}, critical = {critical:?} }}",
+        "disable = [\"services\", {QUIET_KINDS}]\ndisk_mounts = [\"{}\"]\ndisk = {{ warn = {warn:?}, critical = {critical:?} }}\njob_grace = \"1s\"",
         harness.config_dir().display()
     );
     monitor_settings(harness, api_url, &monitor, "")
@@ -217,7 +217,7 @@ async fn a_dead_peer_runner_alerts_from_its_watcher_then_recovers() {
     let monitor =
         format!("digest_at = \"00:00\"\ndisable = [\"services\", \"disk\", {QUIET_KINDS}]");
     let peers = format!(
-        "[[monitor.peer]]\nname = \"b\"\ndisplay_name = \"Peer <b>\"\nurl = \"http://127.0.0.1:{peer_port}\"\ntoken_file = \"{}\"\n",
+        "[[monitor.peer]]\nname = \"b\"\ndisplay_name = \"Peer <b>\"\nurl = \"http://127.0.0.1:{peer_port}\"\ntoken_file = \"{}\"\ndown_after = \"1s\"\n",
         peer_token.display()
     );
     watcher.write_settings(&monitor_settings(&watcher, &api_url, &monitor, &peers));
@@ -378,7 +378,7 @@ async fn plan_jobs_announce_their_start_and_end() {
         )
         .await;
     assert!(
-        started.ends_with("2 steps: <code>quick:first</code>, <code>quick:second</code>"),
+        started.contains("\n2 steps: <code>quick:first</code>, <code>quick:second</code>\n"),
         "{started}"
     );
     bot.expect(
@@ -408,4 +408,61 @@ async fn plan_jobs_announce_their_start_and_end() {
     harness.wait_for_status(id, "succeeded").await;
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     assert_eq!(bot.texts().len(), 4, "{:?}", bot.texts());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_holds_alerts_until_its_grace_time_ends() {
+    let bot = FakeBot::default();
+    let api_url = bot.start().await;
+    let mut harness = Harness::new();
+    harness.write_settings(&disk_settings(&harness, &api_url, 99.99, 100.0));
+    harness.add_adapter("slow", "[actions.wait]\n", "sleep 4\n");
+    harness.add_plan("slow", "steps = [\"slow:wait\"]\n");
+    harness.start().await;
+
+    let id = harness.run("slow", false).await.unwrap();
+    harness.wait_for_step(id, "wait", "running").await;
+    harness.write_settings(&disk_settings(&harness, &api_url, 0.0, 0.0));
+    let key = format!("disk:{}", harness.config_dir().display());
+    harness
+        .wait_until("the disk check is critical during the job", || async {
+            let report = harness.client().get("/monitor").await.ok()?;
+            report["checks"]
+                .as_array()?
+                .iter()
+                .any(|check| check["key"] == key.as_str() && check["level"] == "critical")
+                .then_some(())
+        })
+        .await;
+    assert_eq!(harness.job(id).await["job"]["status"], "running");
+    let started = bot
+        .expect(
+            &harness,
+            "<b>🛠️ UPDATE STARTED · test-host</b>\n",
+            "<b>slow</b>",
+        )
+        .await;
+    assert!(
+        started.ends_with(
+            "\nAlerts for this server are paused during the job and for under a minute after it."
+        ),
+        "{started}"
+    );
+
+    harness.wait_for_status(id, "succeeded").await;
+    bot.expect(&harness, "<b>🔴 CRITICAL · test-host</b>\n", "<b>Disk ")
+        .await;
+    let titles: Vec<String> = bot
+        .texts()
+        .iter()
+        .map(|text| text.lines().next().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "<b>🛠️ UPDATE STARTED · test-host</b>",
+            "<b>✅ UPDATE DONE · test-host</b>",
+            "<b>🔴 CRITICAL · test-host</b>",
+        ]
+    );
 }
