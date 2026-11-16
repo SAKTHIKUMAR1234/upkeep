@@ -1,3 +1,4 @@
+pub mod health;
 pub mod manifest;
 
 use std::collections::BTreeMap;
