@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::checks::Level;
 
@@ -12,14 +12,20 @@ pub struct Policy {
 }
 
 /// What the runner remembers about one check between rounds.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckState {
     /// The settled level: the last one seen `alert_after` rounds in a row.
     pub level: Level,
-    /// When `level` settled.
+    /// The first round of the streak that settled `level`.
     pub since: i64,
     /// Rounds in a row that saw a level other than `level`.
     pub streak: u32,
+    /// The first round of the current streak.
+    #[serde(default)]
+    pub streak_since: i64,
+    /// Rounds that saw `level` since it settled, counting the streak that settled it.
+    #[serde(default)]
+    pub rounds: u32,
     /// When a message for `level` was last sent. None while it waits, for example in quiet hours.
     pub last_sent_at: Option<i64>,
     /// A message went out in this bad spell, so its end gets a recovery message.
@@ -29,8 +35,16 @@ pub struct CheckState {
 /// A message the state machine asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
-    Alert { level: Level, repeat: bool },
-    Recovery { was: Level, since: i64 },
+    Alert {
+        level: Level,
+        repeat: bool,
+    },
+    /// The check was `was` from `since` until the first ok round, `until`.
+    Recovery {
+        was: Level,
+        since: i64,
+        until: i64,
+    },
 }
 
 impl CheckState {
@@ -40,6 +54,8 @@ impl CheckState {
             level: Level::Ok,
             since: now,
             streak: 0,
+            streak_since: now,
+            rounds: 0,
             last_sent_at: None,
             notified: false,
         }
@@ -56,13 +72,18 @@ impl CheckState {
     ) -> Option<Notice> {
         if observed == self.level {
             self.streak = 0;
+            self.rounds += 1;
         } else {
+            if self.streak == 0 {
+                self.streak_since = now;
+            }
             self.streak += 1;
             if self.streak >= policy.alert_after.max(1) {
                 let was = self.level;
                 let was_since = self.since;
                 self.level = observed;
-                self.since = now;
+                self.since = self.streak_since;
+                self.rounds = self.streak;
                 self.streak = 0;
                 self.last_sent_at = None;
                 if observed == Level::Ok {
@@ -70,6 +91,7 @@ impl CheckState {
                     return notified.then_some(Notice::Recovery {
                         was,
                         since: was_since,
+                        until: self.since,
                     });
                 }
             }
@@ -158,9 +180,21 @@ mod tests {
                 None,
                 Some(Notice::Recovery {
                     was: Level::Critical,
-                    since: 60
+                    since: 0,
+                    until: 180,
                 })
             ]
+        );
+        assert_eq!((state.since, state.rounds), (180, 2));
+    }
+
+    #[test]
+    fn rounds_count_every_round_of_the_settled_level() {
+        let mut state = CheckState::new(0);
+        run(&mut state, 0, &[Level::Warn; 5], false);
+        assert_eq!(
+            (state.level, state.since, state.rounds),
+            (Level::Warn, 0, 5)
         );
     }
 

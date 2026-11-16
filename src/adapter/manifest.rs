@@ -125,6 +125,15 @@ impl Service {
             | Self::Process { name, .. } => name,
         }
     }
+
+    /// The unit, container or process pattern the service check looks at.
+    pub fn target(&self) -> &str {
+        match self {
+            Self::Systemd { unit, .. } | Self::SystemdUser { unit, .. } => unit,
+            Self::Docker { container, .. } => container,
+            Self::Process { pattern, .. } => pattern,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -141,6 +150,16 @@ pub struct Ping {
 pub enum PingTarget {
     Http { url: String, expect: u16 },
     Command { command: String },
+}
+
+impl PingTarget {
+    /// The URL or command the ping uses.
+    pub fn target(&self) -> &str {
+        match self {
+            Self::Http { url, .. } => url,
+            Self::Command { command } => command,
+        }
+    }
 }
 
 fn serialize_secs<S: serde::Serializer>(

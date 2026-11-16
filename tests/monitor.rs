@@ -114,7 +114,7 @@ async fn a_disk_over_its_threshold_alerts_then_recovers() {
 
     let disk = format!("disk {}: ", harness.config_dir().display());
     let alert = bot.expect(&harness, "CRITICAL · test-host\n", &disk).await;
-    assert!(alert.contains("% used\n"), "{alert}");
+    assert!(alert.contains(" GB of "), "{alert}");
 
     let report = harness.client().get("/monitor").await.unwrap();
     let key = format!("disk:{}", harness.config_dir().display());

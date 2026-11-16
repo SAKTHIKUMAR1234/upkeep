@@ -58,7 +58,17 @@ fn mount_use(mount: &Path, settings: &MonitorSettings) -> Vec<Observation> {
     let usable = used + stats.blocks_available();
     if settings.is_enabled("disk") && usable > 0 {
         let used_percent = used as f64 * 100.0 / usable as f64;
-        observations.push(percent(format!("disk:{name}"), used_percent, settings.disk));
+        let block = stats.fragment_size() as u64;
+        let sizes = format!(
+            "{} of {}",
+            gigabytes(used as u64 * block),
+            gigabytes(usable as u64 * block)
+        );
+        let observation = percent(format!("disk:{name}"), used_percent, settings.disk);
+        observations.push(Observation {
+            value: format!("{} ({sizes})", observation.value),
+            ..observation.with_subject(sizes)
+        });
     }
     let files = stats.files();
     if settings.is_enabled("inodes") && files > 0 {
@@ -70,6 +80,16 @@ fn mount_use(mount: &Path, settings: &MonitorSettings) -> Vec<Observation> {
         ));
     }
     observations
+}
+
+/// For example "786 GB" or "4.2 GB", in units of 2^30 bytes.
+pub fn gigabytes(bytes: u64) -> String {
+    let size = bytes as f64 / (1u64 << 30) as f64;
+    if size < 10.0 {
+        format!("{size:.1} GB")
+    } else {
+        format!("{size:.0} GB")
+    }
 }
 
 /// Mount points of disk file systems in `/proc/self/mounts`, one per device.
@@ -150,6 +170,7 @@ pub fn load(loadavg: &str, cpus: usize, settings: &MonitorSettings) -> Observati
         evaluate(per_cpu, settings.load),
         format!("{five_minutes:.2} on {cpus} CPUs ({per_cpu:.2} per CPU)"),
     )
+    .with_amount(per_cpu)
 }
 
 #[cfg(test)]
@@ -181,10 +202,12 @@ tmpfs /run tmpfs rw 0 0
         let info = MemInfo::parse(
             "MemTotal: 1000 kB\nMemFree: 10 kB\nMemAvailable: 80 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
         );
+        let memory = info.memory(&settings);
         assert_eq!(
-            info.memory(&settings),
-            Observation::new("memory", Level::Warn, "92% used")
+            (memory.level, memory.value.as_str()),
+            (Level::Warn, "92% used")
         );
+        assert_eq!(memory.amount, Some(92.0));
         assert_eq!(info.swap(&settings).level, Level::Ok);
 
         let info = MemInfo::parse(
@@ -195,11 +218,18 @@ tmpfs /run tmpfs rw 0 0
     }
 
     #[test]
+    fn sizes_read_in_gigabytes() {
+        assert_eq!(gigabytes(786 << 30), "786 GB");
+        assert_eq!(gigabytes(4_509_715_660), "4.2 GB");
+    }
+
+    #[test]
     fn load_is_per_cpu() {
         let settings = MonitorSettings::default();
         let busy = load("9.00 8.40 7.00 3/900 1234", 2, &settings);
         assert_eq!(busy.level, Level::Critical);
         assert_eq!(busy.value, "8.40 on 2 CPUs (4.20 per CPU)");
+        assert_eq!(busy.amount, Some(4.2));
         assert_eq!(
             load("9.00 8.40 7.00 3/900 1234", 8, &settings).level,
             Level::Ok

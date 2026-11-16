@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::checks::{Level, Observation};
 use super::state::CheckState;
@@ -19,7 +19,11 @@ CREATE TABLE IF NOT EXISTS checks (
     notified INTEGER NOT NULL,
     observed TEXT NOT NULL,
     value TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    streak_since INTEGER NOT NULL DEFAULT 0,
+    rounds INTEGER NOT NULL DEFAULT 0,
+    subject TEXT,
+    amount REAL
 );
 CREATE TABLE IF NOT EXISTS check_history (
     id INTEGER PRIMARY KEY,
@@ -44,8 +48,16 @@ CREATE TABLE IF NOT EXISTS meta (
 
 const ENQUEUE: &str = "INSERT INTO outbox (text, created_at, next_attempt_at) VALUES (?1, ?2, ?2)";
 
+/// Columns added after the first release, with their definitions.
+const ADDED_CHECK_COLUMNS: &[(&str, &str)] = &[
+    ("streak_since", "INTEGER NOT NULL DEFAULT 0"),
+    ("rounds", "INTEGER NOT NULL DEFAULT 0"),
+    ("subject", "TEXT"),
+    ("amount", "REAL"),
+];
+
 /// One check as `GET /monitor` shows it.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckRow {
     pub key: String,
     #[serde(flatten)]
@@ -53,7 +65,24 @@ pub struct CheckRow {
     /// The level seen in the latest round. It can differ from `level` while it is debounced.
     pub observed: Level,
     pub value: String,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub amount: Option<f64>,
     pub updated_at: i64,
+}
+
+impl CheckRow {
+    /// The latest round's observation.
+    pub fn observation(&self) -> Observation {
+        Observation {
+            key: self.key.clone(),
+            level: self.observed,
+            value: self.value.clone(),
+            subject: self.subject.clone(),
+            amount: self.amount,
+        }
+    }
 }
 
 /// A message waiting in the outbox.
@@ -74,6 +103,7 @@ impl MonitorDb {
         let connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch(SCHEMA)?;
+        upgrade(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -88,8 +118,8 @@ impl MonitorDb {
     pub fn checks(&self) -> rusqlite::Result<Vec<CheckRow>> {
         let connection = self.lock();
         let mut statement = connection.prepare(
-            "SELECT key, level, since, streak, last_sent_at, notified, observed, value, updated_at \
-             FROM checks ORDER BY key",
+            "SELECT key, level, since, streak, last_sent_at, notified, observed, value, updated_at, \
+             streak_since, rounds, subject, amount FROM checks ORDER BY key",
         )?;
         let rows = statement.query_map([], |row| {
             Ok(CheckRow {
@@ -98,11 +128,15 @@ impl MonitorDb {
                     level: level_column(row, 1)?,
                     since: row.get(2)?,
                     streak: row.get(3)?,
+                    streak_since: row.get(9)?,
+                    rounds: row.get(10)?,
                     last_sent_at: row.get(4)?,
                     notified: row.get(5)?,
                 },
                 observed: level_column(row, 6)?,
                 value: row.get(7)?,
+                subject: row.get(11)?,
+                amount: row.get(12)?,
                 updated_at: row.get(8)?,
             })
         })?;
@@ -131,8 +165,9 @@ impl MonitorDb {
         transaction.execute("DELETE FROM checks", [])?;
         for (observation, state) in round {
             transaction.execute(
-                "INSERT INTO checks (key, level, since, streak, last_sent_at, notified, observed, value, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO checks (key, level, since, streak, last_sent_at, notified, observed, value, \
+                 updated_at, streak_since, rounds, subject, amount) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     observation.key,
                     state.level.as_str(),
@@ -142,7 +177,11 @@ impl MonitorDb {
                     state.notified,
                     observation.level.as_str(),
                     observation.value,
-                    now
+                    now,
+                    state.streak_since,
+                    state.rounds,
+                    observation.subject,
+                    observation.amount
                 ],
             )?;
             let old_level = previous.get(&observation.key).map(|old| old.level);
@@ -245,6 +284,26 @@ impl MonitorDb {
     }
 }
 
+/// Brings a database from an older release to the current shape.
+fn upgrade(connection: &Connection) -> rusqlite::Result<()> {
+    let mut added = Vec::new();
+    for (column, definition) in ADDED_CHECK_COLUMNS {
+        let exists = connection
+            .prepare("SELECT 1 FROM pragma_table_info('checks') WHERE name = ?1")?
+            .exists([column])?;
+        if !exists {
+            connection.execute_batch(&format!(
+                "ALTER TABLE checks ADD COLUMN {column} {definition}"
+            ))?;
+            added.push(*column);
+        }
+    }
+    if added.contains(&"streak_since") {
+        connection.execute_batch("UPDATE checks SET streak_since = updated_at")?;
+    }
+    Ok(())
+}
+
 fn level_column(row: &rusqlite::Row, index: usize) -> rusqlite::Result<Level> {
     let text: String = row.get(index)?;
     text.parse().map_err(|error: String| {
@@ -288,6 +347,47 @@ mod tests {
             .collect();
         assert_eq!(keys, ["load"]);
         assert_eq!(db.due(20).unwrap()[0].text, "disk alert");
+    }
+
+    #[test]
+    fn an_old_database_gets_the_new_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("monitor.db");
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE checks (key TEXT PRIMARY KEY, level TEXT NOT NULL, since INTEGER NOT NULL, \
+             streak INTEGER NOT NULL, last_sent_at INTEGER, notified INTEGER NOT NULL, \
+             observed TEXT NOT NULL, value TEXT NOT NULL, updated_at INTEGER NOT NULL);
+             INSERT INTO checks VALUES ('load', 'ok', 5, 0, NULL, 0, 'ok', '0.1', 9);",
+        )
+        .unwrap();
+        drop(old);
+
+        let db = MonitorDb::open(&path).unwrap();
+        let row = &db.checks().unwrap()[0];
+        assert_eq!(
+            (row.state.rounds, row.state.streak_since, row.amount),
+            (0, 9, None)
+        );
+    }
+
+    #[test]
+    fn rows_keep_subject_amount_and_rounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MonitorDb::open(&dir.path().join("monitor.db")).unwrap();
+        let disk = Observation::new("disk:/", Level::Warn, "84% used")
+            .with_subject("786 GB of 936 GB")
+            .with_amount(84.2);
+        let mut state = CheckState::new(0);
+        state.rounds = 3;
+        db.save_round(&[(disk.clone(), state.clone())], &[], 10)
+            .unwrap();
+        let row = db.checks().unwrap().remove(0);
+        assert_eq!(row.observation(), disk);
+        assert_eq!(row.state, state);
+        let json = serde_json::to_value(&row).unwrap();
+        let back: CheckRow = serde_json::from_value(json).unwrap();
+        assert_eq!(back.observation(), disk);
     }
 
     #[test]

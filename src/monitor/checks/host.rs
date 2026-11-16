@@ -14,11 +14,12 @@ pub const REBOOT_REQUIRED: &str = "/var/run/reboot-required";
 pub fn adapter_health(report: &HealthReport) -> Vec<Observation> {
     let items = report.items.iter().map(|item| {
         let key = format!("{}:{}/{}", item.kind, item.adapter, item.name);
-        match &item.detail {
+        let observation = match &item.detail {
             _ if item.ok => Observation::new(key, Level::Ok, "up"),
             Some(detail) => Observation::new(key, Level::Critical, detail.clone()),
             None => Observation::new(key, Level::Critical, "down"),
-        }
+        };
+        observation.with_subject(&item.target)
     });
     let errors = report.errors.iter().map(|error| {
         let key = format!("adapter:{}", error.path.display());
@@ -60,6 +61,8 @@ pub fn parse_failed_units(output: &str) -> Observation {
         Level::Critical,
         format!("{} failed: {}", units.len(), units.join(", ")),
     )
+    .with_subject(units.join(", "))
+    .with_amount(units.len() as f64)
 }
 
 pub fn reboot_required(flag: &Path) -> Observation {
@@ -97,6 +100,7 @@ pub fn snapshot_age(last_snapshot_at: Option<i64>, max_age: Duration, now: i64) 
             humantime::format_duration(max_age)
         ),
     )
+    .with_amount(age.as_secs() as f64)
 }
 
 /// Pending security updates from apt, read at most once an hour.
@@ -154,6 +158,7 @@ pub fn parse_security_updates(output: &str) -> Observation {
         return Observation::new("security-updates", Level::Ok, "none pending");
     }
     Observation::new("security-updates", Level::Warn, format!("{count} pending"))
+        .with_amount(count as f64)
 }
 
 #[cfg(test)]
@@ -170,6 +175,7 @@ mod tests {
             observation.value,
             "2 failed: motd-news.service, fwupd-refresh.service"
         );
+        assert_eq!(observation.amount, Some(2.0));
         assert_eq!(parse_failed_units("").level, Level::Ok);
     }
 
@@ -198,6 +204,7 @@ mod tests {
         let fresh = snapshot_age(Some(now - 3600), day, now);
         assert_eq!(fresh.level, Level::Ok);
         assert_eq!(fresh.value, "newest is 1h old (max 1day)");
+        assert_eq!(fresh.amount, Some(3600.0));
         assert_eq!(
             snapshot_age(Some(now - 86_400 - 60), day, now).level,
             Level::Warn

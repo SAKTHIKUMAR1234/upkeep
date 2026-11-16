@@ -23,7 +23,7 @@ impl Letterhead {
                     observation.value.clone(),
                 )
             }
-            Notice::Recovery { was, since } => (
+            Notice::Recovery { was, since, .. } => (
                 "RECOVERED".to_owned(),
                 format!(
                     "{} (was {was} for {})",
@@ -136,6 +136,7 @@ mod tests {
         let recovery = Notice::Recovery {
             was: Level::Critical,
             since: NOW - 7500,
+            until: NOW,
         };
         assert_eq!(
             letterhead().notice(&recovery, &peer, NOW),

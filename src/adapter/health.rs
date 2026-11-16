@@ -22,6 +22,8 @@ pub struct HealthItem {
     pub adapter: String,
     pub kind: &'static str,
     pub name: String,
+    /// The unit, container, process pattern, URL or command that was checked.
+    pub target: String,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -34,24 +36,16 @@ pub async fn check_all(catalog: &Catalog, paths: &Paths) -> HealthReport {
         let name = &adapter.manifest.name;
         for service in &adapter.manifest.services {
             checks.push(Box::pin(async move {
-                item(
-                    name,
-                    "service",
-                    service.name(),
-                    check_service(service).await,
-                )
+                let result = check_service(service).await;
+                item(name, "service", service.name(), service.target(), result)
             }));
         }
         let state_dir = paths.adapter_state_dir(name);
         for ping in &adapter.manifest.pings {
             let state_dir = state_dir.clone();
             checks.push(Box::pin(async move {
-                item(
-                    name,
-                    "ping",
-                    &ping.name,
-                    check_ping(adapter, ping, &state_dir).await,
-                )
+                let result = check_ping(adapter, ping, &state_dir).await;
+                item(name, "ping", &ping.name, ping.target.target(), result)
             }));
         }
     }
@@ -64,11 +58,18 @@ pub async fn check_all(catalog: &Catalog, paths: &Paths) -> HealthReport {
     }
 }
 
-fn item(adapter: &str, kind: &'static str, name: &str, result: Result<(), String>) -> HealthItem {
+fn item(
+    adapter: &str,
+    kind: &'static str,
+    name: &str,
+    target: &str,
+    result: Result<(), String>,
+) -> HealthItem {
     HealthItem {
         adapter: adapter.to_owned(),
         kind,
         name: name.to_owned(),
+        target: target.to_owned(),
         ok: result.is_ok(),
         detail: result.err(),
     }

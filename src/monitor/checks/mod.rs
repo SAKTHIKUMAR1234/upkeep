@@ -58,6 +58,10 @@ pub struct Observation {
     pub level: Level,
     /// Short readable value, such as `91% used`.
     pub value: String,
+    /// What the check looks at, such as a systemd unit, a URL or `786 GB of 936 GB`.
+    pub subject: Option<String>,
+    /// The measured number: a percent, a count or an age in seconds, depending on the check.
+    pub amount: Option<f64>,
 }
 
 impl Observation {
@@ -66,7 +70,29 @@ impl Observation {
             key: key.into(),
             level,
             value: value.into(),
+            subject: None,
+            amount: None,
         }
+    }
+
+    pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.subject = Some(subject.into());
+        self
+    }
+
+    pub fn with_amount(mut self, amount: f64) -> Self {
+        self.amount = Some(amount);
+        self
+    }
+
+    /// The part of the key before `:`, such as `disk` for `disk:/`.
+    pub fn kind(&self) -> &str {
+        self.key.split_once(':').map_or(&self.key, |(kind, _)| kind)
+    }
+
+    /// The part of the key after `:`, such as `/` for `disk:/`.
+    pub fn name(&self) -> &str {
+        self.key.split_once(':').map_or("", |(_, name)| name)
     }
 }
 
@@ -83,7 +109,7 @@ pub fn evaluate(value: f64, limits: Limits) -> Level {
 
 /// A percent check, such as `disk:/` at `91% used`.
 pub fn percent(key: String, used: f64, limits: Limits) -> Observation {
-    Observation::new(key, evaluate(used, limits), format!("{used:.0}% used"))
+    Observation::new(key, evaluate(used, limits), format!("{used:.0}% used")).with_amount(used)
 }
 
 #[cfg(test)]
@@ -106,9 +132,11 @@ mod tests {
         for level in [Level::Ok, Level::Warn, Level::Critical] {
             assert_eq!(level.as_str().parse::<Level>().unwrap(), level);
         }
+        let disk = percent("disk:/".into(), 91.4, Limits::new(80.0, 90.0));
         assert_eq!(
-            percent("disk:/".into(), 91.4, Limits::new(80.0, 90.0)),
-            Observation::new("disk:/", Level::Critical, "91% used")
+            disk,
+            Observation::new("disk:/", Level::Critical, "91% used").with_amount(91.4)
         );
+        assert_eq!((disk.kind(), disk.name()), ("disk", "/"));
     }
 }
