@@ -109,6 +109,11 @@ def packages_to_hold(patterns: list[str], installed: list[str], already_held: se
     return sorted(name for name in installed if matches_any(name, patterns) and name not in already_held)
 
 
+def needs_reboot(upgrades: list[dict]) -> bool:
+    """Ubuntu flags a reboot in /run/reboot-required; plain Debian does so only with unattended-upgrades."""
+    return REBOOT_REQUIRED.exists() or any(package["name"].startswith("linux-image-") for package in upgrades)
+
+
 def is_active(unit: str) -> bool:
     return run(["systemctl", "is-active", unit], check=False, quiet=True).strip() == "active"
 
@@ -133,7 +138,7 @@ def update(context: Context) -> int | None:
         if stopped:
             run(["systemctl", "start", *stopped])
 
-    reboot = REBOOT_REQUIRED.exists()
+    reboot = needs_reboot(plan["upgrades"])
     result(upgraded=plan["upgrades"], removed=plan["removals"], held=held, reboot_required=reboot)
     if reboot:
         log("reboot required", level="warn")

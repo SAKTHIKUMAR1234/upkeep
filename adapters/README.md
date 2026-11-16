@@ -6,7 +6,7 @@ Run the tests with `cd adapters && python3 -m unittest`.
 
 ## ubuntu-os
 
-Actions: `check_updates`, `update` (exit 10 when a reboot is required), `verify`, `discover`, `snapshot`, `retention`, `restore`.
+Actions: `check_updates`, `update` (exit 10 when a reboot is required: `/run/reboot-required` exists or a `linux-image-*` package was upgraded, because Debian sets the flag only with unattended-upgrades), `verify`, `discover`, `snapshot`, `retention`, `restore`.
 
 | Field | Default | Meaning |
 |---|---|---|

@@ -1,6 +1,7 @@
 import contextlib
 import io
 import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -50,6 +51,17 @@ class HoldTest(unittest.TestCase):
         installed = ["curl", "docker-ce", "docker-ce-cli", "mariadb-server", "mariadb-client"]
         held = ubuntu_os.packages_to_hold(["mariadb-*", "docker-ce", "postgresql*"], installed, {"mariadb-client"})
         self.assertEqual(held, ["docker-ce", "mariadb-server"])
+
+
+class RebootTest(unittest.TestCase):
+    def test_a_kernel_upgrade_needs_a_reboot_without_the_flag_file(self):
+        with mock.patch.object(ubuntu_os, "REBOOT_REQUIRED", Path("/nonexistent/reboot-required")):
+            self.assertTrue(ubuntu_os.needs_reboot([{"name": "linux-image-6.12.117+deb13-cloud-amd64"}]))
+            self.assertFalse(ubuntu_os.needs_reboot([{"name": "nginx"}, {"name": "linux-base"}]))
+
+    def test_the_flag_file_needs_a_reboot(self):
+        with tempfile.NamedTemporaryFile() as flag, mock.patch.object(ubuntu_os, "REBOOT_REQUIRED", Path(flag.name)):
+            self.assertTrue(ubuntu_os.needs_reboot([]))
 
 
 class UnitsTest(unittest.TestCase):
