@@ -5,19 +5,25 @@ edition = "2024"
 description = "Runs adapter actions and plans as durable, resumable jobs on one server"
 license = "MIT"
 
+[workspace]
+members = [".", "desktop"]
+
 [dependencies]
 anyhow = "1"
+argon2 = "0.6"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+getrandom = "0.4"
 http-body-util = "0.1"
 humantime = "2"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 nix = { version = "0.30", features = ["signal", "process", "hostname", "user", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rpassword = "7"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,3 +36,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Argon2 at 64 MiB is slow without optimization; tests sign in many times.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
