@@ -20,7 +20,8 @@ async fn main() -> std::process::ExitCode {
     let result = match &cli.command {
         Command::Serve => upkeep::api::serve(paths).await,
         Command::StepExec { dir } => upkeep::engine::step_exec::execute(dir).await,
-        Command::Web(args) => upkeep::cli::web::run(args, &paths).await,
+        Command::App(args) => upkeep::cli::app::serve(args).await,
+        Command::User(args) => upkeep::cli::app::user(args),
         _ => {
             // The client exits quietly when its output pipe closes, like `upkeep status | head`.
             // SAFETY: SIG_DFL runs no handler code, and the client installs no SIGPIPE handler.

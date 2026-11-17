@@ -17,11 +17,6 @@ impl Paths {
         self.config_dir.join("token")
     }
 
-    /// Settings of `upkeep web serve`.
-    pub fn web_settings_file(&self) -> PathBuf {
-        self.config_dir.join("web.toml")
-    }
-
     pub fn adapters_dir(&self) -> PathBuf {
         self.config_dir.join("adapters")
     }

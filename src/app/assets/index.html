@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Upkeep</title>
+<link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+<script src="/assets/app.js" defer></script>
+</head>
+<body>
+<div id="boot" class="boot" role="status"><span class="spinner" aria-hidden="true"></span>Loading Upkeep…</div>
+<main id="auth" class="auth" hidden></main>
+<div id="app" class="app" hidden>
+  <aside class="side" aria-label="Navigation">
+    <div class="brand"><i class="logo" aria-hidden="true"></i>Upkeep</div>
+    <nav class="navs">
+      <a class="nav" href="#/" data-nav="overview"><span data-icon="grid"></span>Overview</a>
+      <a class="nav" href="#/history" data-nav="history"><span data-icon="clock"></span>History</a>
+      <a class="nav" href="#/activity" data-nav="activity"><span data-icon="list"></span>Activity</a>
+    </nav>
+    <div class="sect" id="servers-label">Servers</div>
+    <nav id="server-list" class="srvs" aria-labelledby="servers-label"></nav>
+    <button type="button" class="nav nav-add" id="add-server"><span data-icon="plus"></span>Add server</button>
+    <div class="me">
+      <span class="av" id="me-initials" aria-hidden="true"></span>
+      <div class="me-text">
+        <div id="me-email" class="me-email"></div>
+        <div class="me-actions"><button type="button" class="link" id="lock">Lock</button><span aria-hidden="true">·</span><button type="button" class="link" id="sign-out">Sign out</button></div>
+      </div>
+    </div>
+  </aside>
+  <div class="main" id="view" tabindex="-1"></div>
+</div>
+<div id="dialogs"></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>

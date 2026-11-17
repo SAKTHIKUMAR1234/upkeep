@@ -2,55 +2,72 @@
 
 Upkeep runs adapter actions and plans as durable, resumable jobs on one server. `upkeep serve` runs the runner. The `upkeep` client starts and follows jobs on the local runner or on a registered host. See `examples/config` for a runner config and `adapters/README.md` for adapters.
 
-## Web page
+## Desktop app
 
-`upkeep web serve` serves a page where approved users sign in with Google, see each server's checks and latest job, and start plans. The page sends each start to the runner with `confirm = true` and the user's email as `requested_by`. Only the web page holds the runner tokens. The browser never sees them.
+The desktop app runs operations on your servers over SSH. It has email and password sign-in. All state stays on the computer that runs it, in `~/.local/share/upkeep-app` (set another folder with `--data-dir` or `UPKEEP_APP_DIR`). Run output goes to `<data>/runs/<id>.log`.
 
-Roles:
-
-| Role | Can |
-|---|---|
-| `viewer` | See servers, jobs and logs. |
-| `operator` | Also start and stop plans. |
-| `admin` | Also add and remove users and read the activity log. |
-
-Every sign-in, refused sign-in, start, stop and user change goes to the activity log with the time and email.
-
-### Setup
-
-1. In Google Cloud Console, create an OAuth client of type "Web application". Add the redirect URI `<public_url>/auth/callback`, for example `https://upkeep.example.com/auth/callback`.
-2. Put the client secret in an owner-only file: `install -m 600 /dev/null /etc/upkeep/google-client-secret`, then write the secret into it.
-3. For each server, put its runner API token in an owner-only file, for example `/etc/upkeep/hosts/replica.token` (chmod 600).
-4. Write `/etc/upkeep/web.toml`:
-
-```toml
-listen = "100.64.0.11:7880"                  # where the page listens
-public_url = "https://upkeep.example.com"     # what users open; no trailing /
-google_client_id = "1234-abc.apps.googleusercontent.com"
-google_client_secret_file = "/etc/upkeep/google-client-secret"   # chmod 600
-# database = "/var/lib/upkeep/web.db"         # users, sessions and activity log (default)
-# cookie_secure = true                        # false only for local tests over plain http
-
-[hosts.replica]
-label = "Replica server (.11)"
-url = "http://100.64.0.11:7878"               # the runner's listen address
-token_file = "/etc/upkeep/hosts/replica.token"
-
-[hosts.yrp]
-label = "YRP server (.22)"
-url = "http://100.64.0.22:7878"
-token_file = "/etc/upkeep/hosts/yrp.token"
-```
-
-5. Add the first admin, then start the page:
+### Install
 
 ```sh
-sudo upkeep web user add owner@example.com --role admin
-sudo install -m 644 packaging/upkeep-web.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now upkeep-web
+cargo build --release -p upkeep -p upkeep-desktop
+install -m 755 target/release/upkeep target/release/upkeep-desktop ~/.local/bin/
 ```
 
-Manage users with `upkeep web user add <email> --role viewer|operator|admin`, `upkeep web user remove <email>` and `upkeep web user list`, or on the page as an admin. Emails compare without case. Removing a user ends their sessions at once. Use `--settings <file>` to read another settings file.
+The desktop window needs the WebKitGTK 4.1 library (`libwebkit2gtk-4.1-0` on Ubuntu). `upkeep app serve --port 7890` serves the same screens without a window, on `http://127.0.0.1:7890/`. The service listens on 127.0.0.1 only.
 
-The page has no TLS of its own. Put it behind an HTTPS proxy for `public_url`, or reach it only over a private network such as Tailscale. A session lasts 12 hours.
+### Users
+
+Add users with the CLI on the same computer. The command asks for the password twice and does not show it. A password has at least 12 characters.
+
+```sh
+upkeep user add owner@example.com
+upkeep user passwd owner@example.com    # also signs the user out everywhere
+upkeep user disable owner@example.com   # also signs the user out everywhere
+upkeep user enable owner@example.com
+upkeep user list
+```
+
+Passwords are stored as Argon2id hashes (64 MiB, 3 passes, 1 lane, random salt). After 5 failed sign-ins in a row, the email must wait 30 s, then 1 min, up to 15 min. The app locks after 15 minutes without use, and a session ends after 12 hours. The activity log records sign-ins, failed sign-ins, runs, stops, and changes to servers, operations, scripts and users.
+
+### Servers
+
+Click **Add server** and enter a name, an address, the SSH port, the SSH user and the path of a private key file. The app stores only the path. The key file must be readable only by you (`chmod 600`). The SSH user needs passwordless sudo. **Test connection** connects, runs `sudo -n true` and counts the operation folders.
+
+The app uses the system `ssh` with `BatchMode=yes`. It accepts the host key at the first connection and keeps it in `<data>/known_hosts`.
+
+### Operations
+
+An operation is a folder on the server:
+
+```text
+/.upkeep/
+  os-update/
+    run.sh      the work (required)
+    check.sh    a health check after the run (optional)
+```
+
+The folder name has lowercase letters, digits and dashes. Each script starts with a `#!` line. The app writes the scripts as root with mode 0750. You can also put folders on the server yourself: the server is the source of truth.
+
+When you click **Run**, the app runs `sudo -n /.upkeep/<folder>/run.sh` over SSH and shows the output live:
+
+- A line `::step <title>` starts a new step. A script without these lines shows as one step.
+- Exit 0 means OK.
+- Exit 10 means "restart the server". The app runs `sudo -n systemctl reboot`, waits until SSH drops and comes back (at most 15 minutes), then continues.
+- Any other exit code means failed.
+
+Then the app runs `check.sh` if the folder has one. The run is green only when both scripts pass. **Stop** closes the SSH session, which ends the remote script. Each server has one run at a time. A run continues when you close the screens while the service runs. When the service starts, runs that a stopped service left are marked interrupted.
+
+Example `run.sh`:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+echo "::step Clean apt cache"
+apt-get clean
+echo "::step Clean old journals"
+journalctl --vacuum-time=14d
+```
+
+### Tests
+
+`cargo test` runs the unit and HTTP tests. `tests/ssh/run.sh` starts a throwaway Docker container with sshd, runs the SSH tests against it and removes it.

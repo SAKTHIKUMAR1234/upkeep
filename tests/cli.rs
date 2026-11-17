@@ -87,42 +87,59 @@ fn a_missing_restic_is_named_in_the_error() {
 }
 
 #[test]
-fn web_users_are_added_listed_and_removed() {
-    let root = tempfile::tempdir().unwrap();
-    let settings = root.path().join("web.toml");
-    std::fs::write(
-        &settings,
-        "listen = \"127.0.0.1:7880\"\npublic_url = \"https://upkeep.example.com\"\n\
-         google_client_id = \"client-id\"\ngoogle_client_secret_file = \"/missing\"\n\
-         [hosts.replica]\nlabel = \"Replica\"\nurl = \"http://127.0.0.1:7878\"\ntoken_file = \"/missing\"\n",
-    )
-    .unwrap();
-    let web = |args: &[&str]| {
-        let output = Command::new(env!("CARGO_BIN_EXE_upkeep"))
-            .arg("--state-dir")
-            .arg(root.path())
-            .args(["web", "--settings"])
-            .arg(&settings)
+fn app_users_are_added_with_a_typed_password_and_managed() {
+    let data = tempfile::tempdir().unwrap();
+    let user = |args: &[&str], input: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_upkeep"))
+            .args(["user", "--data-dir"])
+            .arg(data.path())
             .args(args)
-            .output()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), input.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
         let text = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
         (output.status.success(), text)
     };
+    let good = "correct horse battery\ncorrect horse battery\n";
 
-    let (added, text) = web(&["user", "add", "Owner@Example.com", "--role", "admin"]);
+    let (added, text) = user(&["add", "Owner@Example.com"], good);
     assert!(added, "{text}");
-    assert!(!web(&["user", "add", "x@example.com", "--role", "root"]).0);
-    assert!(!web(&["user", "add", "not-an-email", "--role", "viewer"]).0);
-    let (_, listing) = web(&["user", "list"]);
     assert!(
-        listing.contains("admin") && listing.contains("owner@example.com"),
+        !text.contains("correct horse"),
+        "the password is never printed: {text}"
+    );
+    let (again, text) = user(&["add", "owner@example.com"], good);
+    assert!(!again && text.contains("exists already"), "{text}");
+    let (short, text) = user(&["add", "b@example.com"], "short\nshort\n");
+    assert!(!short && text.contains("at least 12"), "{text}");
+    let (mismatch, text) = user(
+        &["add", "b@example.com"],
+        "correct horse battery\nother horse battery\n",
+    );
+    assert!(!mismatch && text.contains("do not match"), "{text}");
+    assert!(!user(&["add", "not-an-email"], good).0);
+
+    assert!(
+        user(
+            &["passwd", "OWNER@example.com"],
+            "new horse battery\nnew horse battery\n"
+        )
+        .0
+    );
+    assert!(!user(&["passwd", "nobody@example.com"], good).0);
+    assert!(user(&["disable", "owner@example.com"], "").0);
+    let (_, listing) = user(&["list"], "");
+    assert!(
+        listing.contains("disabled") && listing.contains("owner@example.com"),
         "{listing}"
     );
-    assert!(root.path().join("web.db").exists());
-
-    assert!(web(&["user", "remove", "owner@example.com"]).0);
-    let (removed_again, text) = web(&["user", "remove", "owner@example.com"]);
-    assert!(!removed_again && text.contains("no user"), "{text}");
+    assert!(user(&["enable", "owner@example.com"], "").0);
+    let (_, listing) = user(&["list"], "");
+    assert!(listing.starts_with("enabled"), "{listing}");
+    assert!(data.path().join("upkeep-app.db").exists());
 }

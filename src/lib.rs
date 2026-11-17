@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod api;
+pub mod app;
 pub mod atomic_file;
 pub mod cli;
 pub mod client;
@@ -11,4 +12,3 @@ pub mod secrets;
 pub mod settings;
 pub mod store;
 pub mod time;
-pub mod web;
