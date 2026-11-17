@@ -43,3 +43,10 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# Smaller, faster release binaries. Panics stay unwinding: tokio and axum keep one failed task
+# or request from ending the service.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
