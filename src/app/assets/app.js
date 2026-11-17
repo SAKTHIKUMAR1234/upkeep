@@ -564,6 +564,7 @@ function virtualTable({ columns, template, cells, load, onOpen, emptyText, rowKe
   let loading = false;
   let generation = 0;
   let frame = 0;
+  let destroyed = false;
 
   function draw() {
     frame = 0;
@@ -594,6 +595,7 @@ function virtualTable({ columns, template, cells, load, onOpen, emptyText, rowKe
   }
 
   async function more() {
+    if (destroyed) return;
     loading = true;
     const mine = generation;
     state.replaceChildren(h('span', { class: 'spinner', 'aria-hidden': 'true' }), ' Loading…');
@@ -639,7 +641,14 @@ function virtualTable({ columns, template, cells, load, onOpen, emptyText, rowKe
       if (items.length) state.replaceChildren();
       schedule();
     },
-    destroy() { window.removeEventListener('resize', schedule); },
+    /** Frees the rows when the screen closes; a request that answers later is ignored. */
+    destroy() {
+      destroyed = true;
+      generation += 1;
+      items = [];
+      cancelAnimationFrame(frame);
+      window.removeEventListener('resize', schedule);
+    },
   };
 }
 
@@ -878,6 +887,7 @@ function runView(id) {
   let queuedText = '';
   let queuedLive = null;
   let frame = 0;
+  let closed = false;
 
   follow.addEventListener('click', () => {
     following = !following;
@@ -1029,6 +1039,7 @@ function runView(id) {
     try {
       run = await api('GET', `/runs/${id}`);
       const chunk = await api('GET', `/runs/${id}/output${query({ tail: OUTPUT_TAIL })}`);
+      if (closed) return; // The screen closed while the output loaded.
       const part = chunkLines(chunk, MAX_TERMINAL_LINES, false);
       start = part.start;
       have = chunk.end;
@@ -1046,9 +1057,13 @@ function runView(id) {
   return {
     el,
     destroy() {
+      closed = true;
       if (source) source.close();
+      source = null;
       cancelAnimationFrame(frame);
       clearInterval(ticker);
+      queuedText = '';
+      queuedLive = null;
     },
   };
 }
