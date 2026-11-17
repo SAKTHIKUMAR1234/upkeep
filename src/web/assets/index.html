@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Upkeep</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="bar" id="bar" hidden>
+  <a class="brand" href="#servers">Upkeep</a>
+  <nav><a href="#servers">Servers</a><a href="#history">History</a></nav>
+  <span class="who"><span id="who"></span> · <button class="link" id="sign-out" type="button">Sign out</button></span>
+</header>
+<main class="wrap">
+  <p class="message" id="message" hidden></p>
+
+  <section class="login" id="sign-in" hidden>
+    <b>Upkeep</b>
+    <a class="gbtn" href="/auth/login">Sign in with Google</a>
+    <span class="muted">Only emails on the allowed list can enter. Others see "Not allowed".</span>
+  </section>
+
+  <section id="servers" hidden>
+    <div class="grid" id="cards"></div>
+    <p class="muted" id="viewer-note" hidden>You can see the servers. Ask an admin for the operator role to start updates.</p>
+  </section>
+
+  <section class="screen" id="progress" hidden>
+    <div class="bar inner"><span id="job-title"></span><span class="who" id="job-who"></span></div>
+    <div class="body">
+      <div id="job-steps"></div>
+      <p id="job-result"></p>
+      <div class="row">
+        <span class="actions">
+          <button class="btn ghost" id="job-log-toggle" type="button">Show log</button>
+          <button class="btn danger" id="job-cancel" type="button" hidden>Stop after this step</button>
+        </span>
+        <span class="muted">The same progress is shown in the Telegram group.</span>
+      </div>
+      <pre class="log" id="job-log" hidden></pre>
+    </div>
+  </section>
+
+  <section id="history" hidden>
+    <h2>Updates</h2>
+    <div class="tw"><table><thead><tr><th>When</th><th>Server</th><th>Plan</th><th>By</th><th>Result</th></tr></thead><tbody id="jobs"></tbody></table></div>
+    <div id="admin" hidden>
+      <h2>Users</h2>
+      <div class="tw"><table><thead><tr><th>User (Google email)</th><th>Role</th><th></th></tr></thead><tbody id="users"></tbody></table></div>
+      <form class="row add-user" id="add-user">
+        <input id="new-email" type="email" placeholder="name@example.com" required autocomplete="off">
+        <select id="new-role"><option value="viewer">viewer</option><option value="operator">operator</option><option value="admin">admin</option></select>
+        <button class="btn" type="submit">Add user</button>
+      </form>
+      <h2>Activity</h2>
+      <div class="tw"><table><thead><tr><th>When</th><th>Who</th><th>What</th><th>Server</th><th>Detail</th></tr></thead><tbody id="audit"></tbody></table></div>
+    </div>
+  </section>
+</main>
+
+<dialog id="confirm-dialog">
+  <form class="dlg" method="dialog">
+    <b id="confirm-title"></b>
+    <div class="muted" id="confirm-facts"></div>
+    <div id="confirm-steps"></div>
+    <div class="muted" id="confirm-recovery"></div>
+    <p class="bad" id="confirm-error"></p>
+    <div class="row end">
+      <button class="btn ghost" value="cancel">Cancel</button>
+      <button class="btn" id="confirm-start" type="button">Start update</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

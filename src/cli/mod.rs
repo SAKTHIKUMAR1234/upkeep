@@ -2,6 +2,7 @@ mod monitor;
 mod output;
 mod registry;
 mod snapshots;
+pub mod web;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ use crate::paths::Paths;
 use crate::secrets::Secrets;
 pub use monitor::AlertCommand;
 pub use registry::{DestCommand, HostCommand};
+pub use web::WebArgs;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -127,6 +129,8 @@ pub enum Command {
         #[arg(long, value_name = "NAME")]
         dest: Option<String>,
     },
+    /// The web page: serve it and manage its users.
+    Web(WebArgs),
     /// Run one step detached from the runner (internal).
     #[command(hide = true)]
     StepExec { dir: PathBuf },

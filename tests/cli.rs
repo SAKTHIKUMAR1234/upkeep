@@ -85,3 +85,44 @@ fn a_missing_restic_is_named_in_the_error() {
         "{stderr}"
     );
 }
+
+#[test]
+fn web_users_are_added_listed_and_removed() {
+    let root = tempfile::tempdir().unwrap();
+    let settings = root.path().join("web.toml");
+    std::fs::write(
+        &settings,
+        "listen = \"127.0.0.1:7880\"\npublic_url = \"https://upkeep.example.com\"\n\
+         google_client_id = \"client-id\"\ngoogle_client_secret_file = \"/missing\"\n\
+         [hosts.replica]\nlabel = \"Replica\"\nurl = \"http://127.0.0.1:7878\"\ntoken_file = \"/missing\"\n",
+    )
+    .unwrap();
+    let web = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_upkeep"))
+            .arg("--state-dir")
+            .arg(root.path())
+            .args(["web", "--settings"])
+            .arg(&settings)
+            .args(args)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        (output.status.success(), text)
+    };
+
+    let (added, text) = web(&["user", "add", "Owner@Example.com", "--role", "admin"]);
+    assert!(added, "{text}");
+    assert!(!web(&["user", "add", "x@example.com", "--role", "root"]).0);
+    assert!(!web(&["user", "add", "not-an-email", "--role", "viewer"]).0);
+    let (_, listing) = web(&["user", "list"]);
+    assert!(
+        listing.contains("admin") && listing.contains("owner@example.com"),
+        "{listing}"
+    );
+    assert!(root.path().join("web.db").exists());
+
+    assert!(web(&["user", "remove", "owner@example.com"]).0);
+    let (removed_again, text) = web(&["user", "remove", "owner@example.com"]);
+    assert!(!removed_again && text.contains("no user"), "{text}");
+}

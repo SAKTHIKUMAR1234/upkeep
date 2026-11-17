@@ -54,14 +54,17 @@ impl Token {
     }
 
     fn matches(&self, presented: &str) -> bool {
-        let expected = self.0.as_bytes();
-        let presented = presented.as_bytes();
-        let difference = expected
-            .iter()
-            .zip(presented)
-            .fold(0u8, |acc, (left, right)| acc | (left ^ right));
-        difference == 0 && expected.len() == presented.len()
+        constant_time_eq(&self.0, presented)
     }
+}
+
+/// Compares two secrets in a time that does not depend on where they differ.
+pub fn constant_time_eq(expected: &str, presented: &str) -> bool {
+    let difference = expected
+        .bytes()
+        .zip(presented.bytes())
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right));
+    difference == 0 && expected.len() == presented.len()
 }
 
 /// Rejects TCP requests without the right `Authorization: Bearer <token>` header.

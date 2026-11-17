@@ -98,7 +98,7 @@ fn report_catalog(catalog: &Catalog) {
     }
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("cannot install SIGTERM handler");
     tokio::select! {
