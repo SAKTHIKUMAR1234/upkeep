@@ -13,7 +13,7 @@ cargo build --release -p upkeep -p upkeep-desktop
 install -m 755 target/release/upkeep target/release/upkeep-desktop ~/.local/bin/
 ```
 
-The desktop window needs the WebKitGTK 4.1 library (`libwebkit2gtk-4.1-0` on Ubuntu). `upkeep app serve --port 7890` serves the same screens without a window, on `http://127.0.0.1:7890/`. The service listens on 127.0.0.1 only.
+The desktop window needs the WebKitGTK 4.1 library (`libwebkit2gtk-4.1-0` on Ubuntu). `upkeep app serve --port 7890` serves the same screens without a window, on `http://127.0.0.1:7890/`. Without a public URL, the service accepts only loopback addresses. See [Website](#website) to serve it on a domain.
 
 ### Users
 
@@ -27,7 +27,7 @@ upkeep user enable owner@example.com
 upkeep user list
 ```
 
-Passwords are stored as Argon2id hashes (64 MiB, 3 passes, 1 lane, random salt). After 5 failed sign-ins in a row, the email must wait 30 s, then 1 min, up to 15 min. The app locks after 15 minutes without use, and a session ends after 12 hours. The activity log records sign-ins, failed sign-ins, runs, stops, and changes to servers, operations, scripts and users.
+Passwords are stored as Argon2id hashes (64 MiB, 3 passes, 1 lane, random salt). After 5 failed sign-ins in a row, the email must wait 30 s, then 1 min, up to 15 min. The app locks after 15 minutes without use, and a session ends after 12 hours. Only user input counts as use: keys, clicks, mouse moves, scrolls, touches and returns to the window. While you watch a running run on a visible screen, the run also counts as use. **Lock** keeps your email for the unlock screen. **Sign out** also forgets the email. The activity log records sign-ins, failed sign-ins, runs, stops, and changes to servers, operations, scripts and users.
 
 ### Servers
 
@@ -68,6 +68,34 @@ apt-get clean
 echo "::step Clean old journals"
 journalctl --vacuum-time=14d
 ```
+
+### Website
+
+`upkeep app serve` can also serve the screens as a website behind nginx with HTTPS. Sign-in is necessary for all pages and data. The desktop app does not change.
+
+| Setting | Flag | Default | Effect |
+|---|---|---|---|
+| `listen` | `--listen` | `127.0.0.1:7890` | Address and port. An address that is not loopback needs `public_url`. |
+| `public_url` | `--public-url` | none | The site URL, such as `https://upkeep.example.com`. Only this host and origin get access. Cookies get `Secure`, and responses get HSTS. |
+| `trusted_proxy` | `--trusted-proxy` | none | The proxy address. Only requests from it can name the client with `X-Forwarded-For` or `X-Real-IP`. |
+| `idle_timeout` | `--idle-timeout` | `15m` | The session locks after this time without use. The minimum is `2m`. |
+| `session_lifetime` | `--session-lifetime` | `12h` | The session ends this long after sign-in. |
+
+Put the settings in a TOML file and give it with `--config <file>`. Flags win over the file. See `packaging/upkeep-app.toml`.
+
+On a website, one client may make 10 sign-ins in 15 minutes that fail or are still running, and at most 2 at the same time. A client is one IPv4 address, or one IPv6 /64 network. Then the service answers `429` with `Retry-After`. Each failed sign-in writes one log line, `upkeep: failed sign-in from <client> for "<email>"`, for fail2ban. `<client>` is the IPv4 address, or the network such as `2001:db8:1:2::/64`.
+
+Set up the website on a server:
+
+1. Install the `upkeep` binary in `/usr/local/bin`.
+2. Add the service user: `sudo useradd --system --home-dir /var/lib/upkeep-app --shell /usr/sbin/nologin upkeep`.
+3. Install the settings file: `sudo install -D -m 644 packaging/upkeep-app.toml /etc/upkeep-app/app.toml`. Then set `public_url` to your host name.
+4. Copy `packaging/upkeep-app.service` to `/etc/systemd/system/`, then run `sudo systemctl daemon-reload` and `sudo systemctl enable --now upkeep-app`.
+5. Add users: `sudo -u upkeep UPKEEP_APP_DIR=/var/lib/upkeep-app upkeep user add owner@example.com`.
+6. Put the SSH keys in `/var/lib/upkeep-app/keys`, owned by `upkeep` with mode `600`. The service cannot read home folders.
+7. Get a TLS certificate for the host name, for example with certbot.
+8. Copy `packaging/nginx/upkeep.conf` to `/etc/nginx/sites-enabled/`, set the host name and the certificate paths, then run `sudo nginx -t` and `sudo systemctl reload nginx`.
+9. Copy `packaging/fail2ban/filter.d/upkeep.conf` and `packaging/fail2ban/jail.d/upkeep.conf` to the same folders in `/etc/fail2ban/`, then run `sudo systemctl reload fail2ban`.
 
 ### Tests
 

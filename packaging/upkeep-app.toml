@@ -1,0 +1,6 @@
+# /etc/upkeep-app/app.toml for `upkeep app serve --config`. Flags win over this file.
+listen = "127.0.0.1:7890"
+public_url = "https://upkeep.example.com"
+trusted_proxy = "127.0.0.1"
+idle_timeout = "15m"
+session_lifetime = "12h"

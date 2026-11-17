@@ -1,0 +1,41 @@
+[Unit]
+Description=Upkeep website
+Documentation=https://github.com/essdee/upkeep
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=upkeep
+Group=upkeep
+Environment=UPKEEP_APP_DIR=/var/lib/upkeep-app
+ExecStart=/usr/local/bin/upkeep app serve --config /etc/upkeep-app/app.toml
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=upkeep-app
+StateDirectoryMode=0700
+ConfigurationDirectory=upkeep-app
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/upkeep-app
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
