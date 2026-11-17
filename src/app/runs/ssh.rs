@@ -3,16 +3,22 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::app::AppConfig;
-use crate::app::store::ServerFields;
+use crate::app::store::{Server, ServerFields};
 
 /// What `ssh` exits with when it cannot connect or loses the connection.
 const SSH_FAILED: i32 = 255;
 /// The most stdout or stderr kept from a short command.
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
+/// How long a shared connection stays open after its last command.
+const CONNECTION_IDLE: &str = "ControlPersist=5m";
+/// A Unix socket path holds 107 bytes, and `ssh` adds 17 while it creates the socket.
+const MAX_SOCKET_PATH: usize = 90;
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
@@ -37,6 +43,8 @@ pub struct Ssh {
     program: PathBuf,
     known_hosts: PathBuf,
     target: ServerFields,
+    /// The socket of the connection that commands share; `None` opens one per command.
+    socket: Option<PathBuf>,
 }
 
 /// The result of a short remote command.
@@ -48,11 +56,42 @@ pub struct Output {
 }
 
 impl Ssh {
+    /// Opens one connection per command, such as for settings that are not saved yet.
     pub fn new(config: &AppConfig, target: &ServerFields) -> Self {
         Self {
             program: config.ssh_program.clone(),
             known_hosts: config.known_hosts(),
             target: target.clone(),
+            socket: None,
+        }
+    }
+
+    /// Commands to a saved server share one connection, which stays open for a while after the
+    /// last one. Other settings get another socket, so a changed server never uses an old
+    /// connection. A data folder with a long path opens one connection per command.
+    pub fn shared(config: &AppConfig, server: &Server) -> Self {
+        let socket = config
+            .connections_dir()
+            .join(socket_name(server.id, &server.fields()));
+        let fits = socket.as_os_str().len() <= MAX_SOCKET_PATH;
+        Self {
+            socket: fits.then_some(socket),
+            ..Self::new(config, &server.fields())
+        }
+    }
+
+    /// The same server with one connection per command, such as while it restarts.
+    pub fn unshared(&self) -> Self {
+        Self {
+            socket: None,
+            ..self.clone()
+        }
+    }
+
+    /// Ends the shared connection. A restart request leaves it open while the server goes down.
+    pub async fn close(&self) {
+        if let Some(socket) = &self.socket {
+            close_socket(&self.program, socket).await;
         }
     }
 
@@ -71,7 +110,14 @@ impl Ssh {
             .arg("-o")
             .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
             .args(["-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15"])
-            .args(["-o", "LogLevel=ERROR", "-l", &self.target.ssh_user])
+            .args(["-o", "LogLevel=ERROR", "-l", &self.target.ssh_user]);
+        match &self.socket {
+            Some(socket) => command
+                .args(["-o", "ControlMaster=auto", "-o", CONNECTION_IDLE, "-o"])
+                .arg(format!("ControlPath={}", socket.display())),
+            None => command.args(["-o", "ControlPath=none"]),
+        };
+        command
             .arg("--")
             .arg(&self.target.address)
             .arg(remote)
@@ -131,6 +177,58 @@ impl Output {
             .unwrap_or("ssh ended without a message")
             .trim()
             .to_owned()
+    }
+}
+
+/// `<server id>-<hash of the connection settings>`, short enough for a socket path.
+fn socket_name(server_id: i64, target: &ServerFields) -> String {
+    let settings = format!(
+        "{}\0{}\0{}\0{}",
+        target.address, target.port, target.ssh_user, target.key_path
+    );
+    let hash = Sha256::digest(settings.as_bytes());
+    let hex: String = hash[..5].iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{server_id}-{hex}")
+}
+
+/// Ends every shared connection of a server, such as when it is deleted or its settings change.
+pub async fn close_connections(config: &AppConfig, server_id: i64) {
+    let prefix = format!("{server_id}-");
+    let Ok(entries) = std::fs::read_dir(config.connections_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            close_socket(&config.ssh_program, &entry.path()).await;
+        }
+    }
+}
+
+/// Asks the connection on `socket` to end. When none answers, the socket is left over from a
+/// connection that died, and it is removed.
+async fn close_socket(program: &Path, socket: &Path) {
+    let exit = Command::new(program)
+        .arg("-o")
+        .arg(format!("ControlPath={}", socket.display()))
+        // `-O` talks to the local socket only; the host name is not used.
+        .args(["-O", "exit", "--", "upkeep"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    let ended = matches!(
+        tokio::time::timeout(CLOSE_TIMEOUT, exit).await,
+        Ok(Ok(status)) if status.success()
+    );
+    if ended {
+        return;
+    }
+    match std::fs::remove_file(socket) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(socket = %socket.display(), %error, "cannot remove an SSH socket");
+        }
+        _ => {}
     }
 }
 
@@ -217,7 +315,7 @@ mod tests {
             "-o StrictHostKeyChecking=accept-new",
             "-o ConnectTimeout=10",
             "-o ServerAliveInterval=15",
-            "-l ubuntu -- 10.0.0.1 sudo -n true",
+            "-l ubuntu -o ControlPath=none -- 10.0.0.1 sudo -n true",
         ] {
             assert!(joined.contains(expected), "{expected} in {joined}");
         }
@@ -226,5 +324,84 @@ mod tests {
             config.known_hosts().display()
         )));
         assert_eq!(arguments.last().unwrap(), "sudo -n true");
+    }
+
+    fn arguments(ssh: &Ssh) -> String {
+        let command = ssh.command("true", false).unwrap();
+        let arguments: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        arguments.join(" ")
+    }
+
+    #[test]
+    fn saved_servers_share_one_connection_per_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        std::fs::write(&key, "key").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = AppConfig::new(dir.path().join("data"));
+        let server = Server {
+            id: 7,
+            name: "Replica".into(),
+            address: "10.0.0.1".into(),
+            port: 22,
+            ssh_user: "ubuntu".into(),
+            key_path: key.display().to_string(),
+            reachable: None,
+            created_at: 0,
+        };
+        let shared = arguments(&Ssh::shared(&config, &server));
+        let socket = config
+            .connections_dir()
+            .join(socket_name(7, &server.fields()));
+        for expected in [
+            "-o ControlMaster=auto".to_owned(),
+            "-o ControlPersist=5m".to_owned(),
+            format!("-o ControlPath={}", socket.display()),
+        ] {
+            assert!(shared.contains(&expected), "{expected} in {shared}");
+        }
+        assert!(
+            socket
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("7-")
+        );
+
+        let moved = Server {
+            port: 2222,
+            ..server.clone()
+        };
+        assert_ne!(
+            socket_name(7, &moved.fields()),
+            socket_name(7, &server.fields()),
+            "changed settings never reuse a connection"
+        );
+        assert!(arguments(&Ssh::shared(&config, &server).unshared()).contains("ControlPath=none"));
+
+        let deep = AppConfig::new(dir.path().join("d".repeat(MAX_SOCKET_PATH)));
+        assert!(arguments(&Ssh::shared(&deep, &server)).contains("ControlPath=none"));
+    }
+
+    #[tokio::test]
+    async fn closing_a_server_removes_only_its_dead_sockets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::new(dir.path().into());
+        config.ssh_program = "false".into();
+        let sockets = config.connections_dir();
+        std::fs::create_dir_all(&sockets).unwrap();
+        for name in ["3-aaaaaaaaaa", "3-bbbbbbbbbb", "33-aaaaaaaaaa"] {
+            std::fs::write(sockets.join(name), "").unwrap();
+        }
+        close_connections(&config, 3).await;
+        let left: Vec<String> = std::fs::read_dir(&sockets)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["33-aaaaaaaaaa"]);
     }
 }

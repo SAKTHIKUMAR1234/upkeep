@@ -13,6 +13,12 @@ const EXIT_SUDO: i32 = 41;
 const EXIT_NO_ROOT: i32 = 42;
 const EXIT_NOT_FOUND: i32 = 43;
 const EXIT_EXISTS: i32 = 44;
+/// What a script command exits with when another operation holds the server lock.
+pub const EXIT_LOCKED: i32 = 75;
+/// Lets one operation at a time run on a server, from any app. `/run` is empty after a boot.
+const LOCK: &str = "/run/lock/upkeep.lock";
+/// Names the run that holds the lock.
+const LOCK_OWNER: &str = "/run/lock/upkeep.owner";
 /// Every command first checks that sudo works without a password.
 const SUDO_CHECK: &str = "sudo -n true 2>/dev/null || exit 41";
 
@@ -191,9 +197,43 @@ pub async fn probe(ssh: &Ssh, folder: &str) -> Result<bool, OperationError> {
     Ok(remote(ssh, &command, None, TIMEOUT).await?.trim() == "check")
 }
 
-/// The remote command that runs one script of an operation as root.
+/// The remote command that runs one script of an operation as root, as the run shows it.
 pub fn script_command(folder: &str, file: &str) -> Result<String, OperationError> {
     Ok(format!("sudo -n {}", path(checked(folder)?, file)))
+}
+
+/// Runs one script of an operation as root while it holds the server lock, and writes `owner`
+/// to the owner file. It exits with `EXIT_LOCKED` at once when another run holds the lock. The
+/// shell keeps the lock until the script ends; the script itself gets no lock descriptor, so a
+/// process that it leaves running does not keep the lock.
+pub fn locked_script_command(
+    folder: &str,
+    file: &str,
+    owner: &str,
+) -> Result<String, OperationError> {
+    let script = format!(
+        "mkdir -p /run/lock || exit 1; exec 9>>{LOCK} || exit 1; \
+         flock -n 9 || exit {EXIT_LOCKED}; \
+         printf '%s since %s\\n' \"$1\" \"$(date '+%F %T %Z')\" > {LOCK_OWNER}; \
+         \"$2\" 9>&-"
+    );
+    Ok(format!(
+        "sudo -n sh -c {} upkeep {} {}",
+        quote(&script),
+        quote(owner),
+        path(checked(folder)?, file)
+    ))
+}
+
+/// The run that holds the server lock, from its owner file; `None` when the lock is free.
+pub async fn lock_owner(ssh: &Ssh) -> Result<Option<String>, OperationError> {
+    let command = format!(
+        "{SUDO_CHECK}; if sudo -n flock -n {LOCK} true; then echo free; \
+         else sudo -n cat {LOCK_OWNER} 2>/dev/null || true; fi"
+    );
+    let stdout = remote(ssh, &command, None, TIMEOUT).await?;
+    let owner = stdout.trim();
+    Ok((owner != "free").then(|| owner.to_owned()))
 }
 
 /// Creates `/.upkeep/<folder>` with its scripts, owned by root with mode 0750.

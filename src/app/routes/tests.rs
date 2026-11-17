@@ -12,8 +12,9 @@ use crate::app::{AppConfig, Service};
 
 const PASSWORD: &str = "correct horse battery";
 
-/// Stands in for `ssh`: runs the remote command on this machine with `/.upkeep` moved to a test
-/// folder, and fails like `ssh` while `<root>.down` exists.
+/// Stands in for `ssh`: runs the remote command on this machine with `/.upkeep` and `/run/lock`
+/// moved to test folders, and fails like `ssh` while `<root>.down` exists. Every server of a test
+/// is the same machine, so they share one lock.
 const FAKE_SSH: &str = r#"#!/bin/bash
 root="__ROOT__"
 while [ $# -gt 0 ]; do
@@ -36,7 +37,8 @@ sudo() {
   esac
 }
 export -f sudo
-bash -c "${1//\/.upkeep/$root}" | sed -u "s#$root#/.upkeep#g"
+command="${1//\/.upkeep/$root}"
+bash -c "${command//\/run\/lock/$root.lock}" | sed -u "s#$root.lock#/run/lock#g; s#$root#/.upkeep#g"
 exit "${PIPESTATUS[0]}"
 "#;
 
@@ -840,6 +842,65 @@ async fn progress_output_keeps_only_the_final_redraw() {
     );
     let text = events.text().await.unwrap();
     assert!(text.contains(r#""live":[]"#), "{text}");
+}
+
+#[tokio::test]
+async fn a_server_runs_one_operation_at_a_time_from_any_app() {
+    let world = World::new().await;
+    let session = world.sign_in().await;
+    let first = world.add_server(&session).await;
+    // A second server entry for the same machine stands in for another app.
+    let body = json!({"name": "Same machine", "address": "10.0.0.1", "ssh_user": "ubuntu", "key_path": world.key()});
+    let (_, second) = world
+        .call(Method::POST, "/api/servers", Some(body), &session)
+        .await;
+    let second = second["id"].as_i64().unwrap();
+    let long = "#!/bin/sh\necho started\nsleep 30\n";
+    world
+        .create_operation(&session, first, "long", long, "")
+        .await;
+    world
+        .create_operation(&session, second, "quick", "#!/bin/sh\necho quick\n", "")
+        .await;
+
+    let held = world.start_run(&session, first, "long").await;
+    while !world.output(&session, held).await.contains("started") {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let refused = world.start_run(&session, second, "quick").await;
+    let run = world.finished_run(&session, refused).await;
+    assert_eq!(
+        (run["status"].as_str(), run["exit_code"].as_i64()),
+        (Some("failed"), Some(75))
+    );
+    let detail = run["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with(&format!(
+            "another operation is already running on this server: long by owner@example.com, run #{held} since "
+        )),
+        "{detail}"
+    );
+    assert!(!world.output(&session, refused).await.contains("quick\n"));
+
+    let stop = format!("/api/runs/{held}/stop");
+    world.call(Method::POST, &stop, None, &session).await;
+    world.finished_run(&session, held).await;
+    let after_stop = world.start_run(&session, second, "quick").await;
+    assert_eq!(
+        world.finished_run(&session, after_stop).await["status"],
+        "succeeded"
+    );
+
+    let own_code = "#!/bin/sh\nexit 75\n";
+    world
+        .create_operation(&session, second, "own-code", own_code, "")
+        .await;
+    let run = world.start_run(&session, second, "own-code").await;
+    let run = world.finished_run(&session, run).await;
+    assert_eq!(
+        run["detail"], "run.sh exited with 75",
+        "a script's own 75 is not the lock"
+    );
 }
 
 #[tokio::test]

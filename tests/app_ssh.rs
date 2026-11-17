@@ -7,7 +7,7 @@ use std::time::Duration;
 use upkeep::app::AppConfig;
 use upkeep::app::operations::{self, Scripts};
 use upkeep::app::runs::Executor;
-use upkeep::app::runs::ssh::Ssh;
+use upkeep::app::runs::ssh::{Ssh, close_connections};
 use upkeep::app::servers::test_connection;
 use upkeep::app::store::{
     CachedOperation, Db, RunRecord, RunStatus, Server, ServerFields, StepStatus,
@@ -57,7 +57,12 @@ impl Remote {
     }
 
     fn ssh(&self) -> Ssh {
-        Ssh::new(&self.config, &self.server.fields())
+        Ssh::shared(&self.config, &self.server)
+    }
+
+    /// The sockets of the shared connections.
+    fn sockets(&self) -> usize {
+        std::fs::read_dir(self.config.connections_dir()).map_or(0, |entries| entries.count())
     }
 
     async fn create(&self, folder: &str, run_sh: &str, check_sh: &str) {
@@ -163,6 +168,19 @@ async fn operations_run_over_real_ssh() {
         .unwrap();
     assert_eq!(changes, [("check.sh", "+1 −0 lines".to_owned())]);
 
+    // The calls above share one connection; changed settings never use it.
+    assert_eq!(remote.sockets(), 1);
+    let moved = Server {
+        port: 1,
+        ..remote.server.clone()
+    };
+    let refused = Ssh::shared(&remote.config, &moved)
+        .run("true", None, Duration::from_secs(30))
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    let tested = test_connection(&remote.config, &moved.fields()).await;
+    assert!(!tested.ok, "{tested:?}");
+
     // A run with steps, then check.sh.
     let run = remote.run("steps").await;
     assert_eq!(
@@ -238,6 +256,19 @@ async fn operations_run_over_real_ssh() {
             .to_string()
             .contains("already has an active run")
     );
+    // Another app, such as on a second laptop, is refused by the lock on the server.
+    let other = Remote::new();
+    let refused = other.run("steps").await;
+    assert_eq!(
+        (refused.status, refused.exit_code),
+        (RunStatus::Failed, Some(75))
+    );
+    let detail = refused.detail.unwrap();
+    let holder = format!(
+        "another operation is already running on this server: long by tester@example.com, run #{} since ",
+        started.id
+    );
+    assert!(detail.starts_with(&holder), "{detail}");
     remote
         .executor
         .stop(started.id, "tester@example.com")
@@ -253,6 +284,13 @@ async fn operations_run_over_real_ssh() {
     let left = remote.remote("pgrep -x sleep || echo none").await;
     assert_eq!(left.trim(), "none", "the remote script ended");
     assert_eq!(remote.db.active_run(remote.server.id).unwrap(), None);
+    let after_stop = other.run("steps").await;
+    assert_eq!(
+        after_stop.status,
+        RunStatus::Succeeded,
+        "stop frees the lock"
+    );
+    close_connections(&other.config, other.server.id).await;
 
     // Delete.
     for folder in ["steps", "check-fails", "restart", "long"] {
@@ -264,4 +302,7 @@ async fn operations_run_over_real_ssh() {
             .unwrap()
             .is_empty()
     );
+    assert_eq!(remote.sockets(), 1);
+    close_connections(&remote.config, remote.server.id).await;
+    assert_eq!(remote.sockets(), 0, "deleting a server ends its connection");
 }

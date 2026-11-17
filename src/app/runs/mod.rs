@@ -113,7 +113,7 @@ impl Executor {
         user: &str,
     ) -> Result<RunRecord, RunError> {
         let folder = operation.folder.as_str();
-        let command = operations::script_command(folder, "run.sh")?;
+        operations::script_command(folder, "run.sh")?;
         let title = operation
             .title
             .clone()
@@ -153,10 +153,9 @@ impl Executor {
         let task = RunTask {
             db: self.db.clone(),
             config: self.config.clone(),
-            ssh: Ssh::new(&self.config, &server.fields()),
+            ssh: Ssh::shared(&self.config, server),
             run: run.clone(),
             steps,
-            command,
             log,
             batch: Batch::default(),
             events,
@@ -240,7 +239,6 @@ struct RunTask {
     ssh: Ssh,
     run: RunRecord,
     steps: Steps,
-    command: String,
     log: RunLog,
     batch: Batch,
     events: broadcast::Sender<RunEvent>,
@@ -287,8 +285,7 @@ impl RunTask {
     async fn flow(&mut self) -> Result<End, End> {
         let has_check = self.connect().await?;
         self.begin(RUN_SCRIPT);
-        let command = self.command.clone();
-        let code = self.stream(&command).await?;
+        let code = self.stream("run.sh").await?;
         match steps::outcome(code) {
             Outcome::Ok => {}
             Outcome::Restart => self.restart().await?,
@@ -302,9 +299,7 @@ impl RunTask {
         }
         if has_check {
             self.begin(CHECK_SCRIPT);
-            let command = operations::script_command(&self.run.operation, "check.sh")
-                .expect("the folder was checked at start");
-            let code = self.stream(&command).await?;
+            let code = self.stream("check.sh").await?;
             if code != Some(0) {
                 return Err(End::failed(
                     RunStatus::CheckFailed,
@@ -340,15 +335,17 @@ impl RunTask {
     }
 
     /// Exit 10: restarts the server and waits until SSH drops and comes back, or the boot id
-    /// changes.
+    /// changes. The shared connection ends after the request, and the waiting uses a new
+    /// connection for each try, so a connection that hangs on the old boot cannot answer.
     async fn restart(&mut self) -> Result<(), End> {
         self.begin(RESTART);
-        let boot_id = self.boot_id().await;
+        let before = boot_id(&self.ssh).await;
         let reboot = self.config.reboot_command.clone();
         self.print(&format!("$ {reboot}")).await;
         let request = self.ssh.run(&reboot, None, REBOOT_REQUEST_TIMEOUT);
         // The connection may drop before the command answers.
         let _ = self.unless_stopped(request).await?;
+        self.ssh.close().await;
         self.print("waiting for the server to come back").await;
 
         let deadline = tokio::time::Instant::now() + self.config.reboot_timeout;
@@ -356,9 +353,9 @@ impl RunTask {
         while tokio::time::Instant::now() < deadline {
             self.unless_stopped(tokio::time::sleep(self.config.reboot_poll))
                 .await?;
-            match self.boot_id().await {
+            match boot_id(&self.ssh.unshared()).await {
                 None => dropped = true,
-                Some(current) if dropped || boot_id.as_ref().is_some_and(|old| *old != current) => {
+                Some(current) if dropped || before.as_ref().is_some_and(|old| *old != current) => {
                     self.print("the server is back").await;
                     return Ok(());
                 }
@@ -373,17 +370,18 @@ impl RunTask {
         ))
     }
 
-    async fn boot_id(&mut self) -> Option<String> {
-        let output = self.ssh.run(BOOT_ID, None, PROBE_TIMEOUT).await.ok()?;
-        (output.code == Some(0)).then(|| output.stdout.trim().to_owned())
-    }
-
-    /// Runs a remote script on a terminal and streams its lines. Returns its exit code.
-    async fn stream(&mut self, command: &str) -> Result<Option<i32>, End> {
-        self.print(&format!("$ {command}")).await;
+    /// Runs a script of the operation on a terminal under the server lock and streams its
+    /// lines. Returns its exit code, or ends the run when another run holds the lock.
+    async fn stream(&mut self, file: &str) -> Result<Option<i32>, End> {
+        let folder = &self.run.operation;
+        let shown = operations::script_command(folder, file).expect("the folder was checked");
+        let owner = format!("{folder} by {}, run #{}", self.run.user, self.run.id);
+        let command = operations::locked_script_command(folder, file, &owner)
+            .expect("the folder was checked");
+        self.print(&format!("$ {shown}")).await;
         let spawned = self
             .ssh
-            .command(command, true)
+            .command(&command, true)
             .and_then(|mut command| command.spawn().map_err(SshError::Spawn));
         let mut child =
             spawned.map_err(|error| End::failed(RunStatus::Failed, None, error.to_string()))?;
@@ -422,6 +420,10 @@ impl RunTask {
             self.print(stderr.trim_end()).await;
         }
         match status {
+            Ok(status) if status.code() == Some(operations::EXIT_LOCKED) => {
+                self.refuse_if_locked().await?;
+                Ok(status.code())
+            }
             Ok(status) if status.code() == Some(255) => Err(End::failed(
                 RunStatus::Failed,
                 Some(255),
@@ -430,6 +432,23 @@ impl RunTask {
             Ok(status) => Ok(status.code()),
             Err(error) => Err(End::failed(RunStatus::Failed, None, error.to_string())),
         }
+    }
+
+    /// Ends the run when another run holds the server lock. A script may also exit with the
+    /// same code on its own; then the lock is free and the code stands.
+    async fn refuse_if_locked(&self) -> Result<(), End> {
+        let Ok(Some(owner)) = operations::lock_owner(&self.ssh).await else {
+            return Ok(());
+        };
+        let mut detail = "another operation is already running on this server".to_owned();
+        if !owner.is_empty() {
+            detail = format!("{detail}: {owner}");
+        }
+        Err(End::failed(
+            RunStatus::Failed,
+            Some(operations::EXIT_LOCKED),
+            detail,
+        ))
     }
 
     /// Adds closed lines and the live rows to the output, and turns `::step` lines into steps.
@@ -518,6 +537,11 @@ async fn stop_requested(stop: &mut watch::Receiver<Option<String>>) {
     if stop.wait_for(Option::is_some).await.is_err() {
         std::future::pending::<()>().await;
     }
+}
+
+async fn boot_id(ssh: &Ssh) -> Option<String> {
+    let output = ssh.run(BOOT_ID, None, PROBE_TIMEOUT).await.ok()?;
+    (output.code == Some(0)).then(|| output.stdout.trim().to_owned())
 }
 
 fn exit_text(script: &str, code: Option<i32>) -> String {

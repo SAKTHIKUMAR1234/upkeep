@@ -23,7 +23,7 @@ struct OperationView {
 }
 
 fn ssh(state: &AppState, server: &Server) -> Ssh {
-    Ssh::new(state.executor.config(), &server.fields())
+    Ssh::shared(state.executor.config(), server)
 }
 
 /// Stores whether SSH worked, from the result of a remote call.

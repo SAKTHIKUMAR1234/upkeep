@@ -54,13 +54,18 @@ impl AppConfig {
         self.runs_dir().join(format!("{run_id}.log"))
     }
 
+    /// The sockets of the shared SSH connections, one per server.
+    pub fn connections_dir(&self) -> PathBuf {
+        self.data_dir.join("ssh")
+    }
+
     pub fn known_hosts(&self) -> PathBuf {
         self.data_dir.join("known_hosts")
     }
 
     /// Creates the owner-only data folder and opens the database.
     pub fn open_db(&self) -> anyhow::Result<Db> {
-        for dir in [&self.data_dir, &self.runs_dir()] {
+        for dir in [&self.data_dir, &self.runs_dir(), &self.connections_dir()] {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;

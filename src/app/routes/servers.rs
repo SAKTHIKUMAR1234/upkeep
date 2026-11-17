@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::{AppError, AppState, Auth};
-use crate::app::runs::ssh::check_key;
+use crate::app::runs::ssh::{check_key, close_connections};
 use crate::app::servers::{ServerInput, test_connection};
 use crate::app::store::{Activity, RunRecord, Server, ServerFields, is_unique_violation};
 use crate::time::now_millis;
@@ -146,6 +146,9 @@ pub async fn edit(
         .db
         .update_server(id, &fields)
         .map_err(|error| name_taken(error, &fields.name))?;
+    if old.fields() != fields {
+        close_connections(state.executor.config(), id).await;
+    }
     let detail = changed_fields(&old.fields(), &fields);
     state.record(
         &auth.email,
@@ -187,6 +190,7 @@ pub async fn delete(
         )));
     }
     state.db.delete_server(id)?;
+    close_connections(state.executor.config(), id).await;
     let detail = format!("{}@{}", server.ssh_user, server.address);
     state.record(
         &auth.email,
