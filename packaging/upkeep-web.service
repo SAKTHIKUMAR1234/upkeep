@@ -1,0 +1,22 @@
+[Unit]
+Description=Upkeep web page
+Documentation=https://github.com/essdee/upkeep
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/upkeep web serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+ConfigurationDirectory=upkeep
+StateDirectory=upkeep
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
