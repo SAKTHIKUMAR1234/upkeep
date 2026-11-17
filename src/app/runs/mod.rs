@@ -1,6 +1,7 @@
 pub mod output;
 pub mod ssh;
 pub mod steps;
+pub mod terminal;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,7 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Child;
 use tokio::sync::{broadcast, watch};
+use tokio::time::Instant;
 
 use super::AppConfig;
 use super::operations::{self, OperationError};
@@ -17,9 +19,10 @@ use super::store::{
     CachedOperation, Db, NewRun, RunRecord, RunStatus, Server, StepStatus, StoreError,
 };
 use crate::time::now_millis;
-use output::RunLog;
+use output::{Batch, RunLog};
 use ssh::{Ssh, SshError};
-use steps::{CHECK_SCRIPT, CONNECT, LineSplitter, Outcome, RESTART, RUN_SCRIPT, Steps};
+use steps::{CHECK_SCRIPT, CONNECT, Outcome, RESTART, RUN_SCRIPT, Steps};
+use terminal::Terminal;
 
 const EVENT_BUFFER: usize = 1024;
 const READ_BUFFER: usize = 16 * 1024;
@@ -55,16 +58,25 @@ pub enum RunEvent {
     Output(OutputEvent),
 }
 
-/// Lines appended to the output file, with their byte range in it.
+/// Lines appended to the output file, with their byte range in it, and the rows after them that
+/// the terminal may still redraw.
 #[derive(Clone, Debug, Serialize)]
 pub struct OutputEvent {
     pub start: u64,
     pub end: u64,
     pub text: String,
+    pub live: Vec<String>,
+}
+
+/// What a run view follows: the events, and the live rows that are not in the output file yet.
+pub struct Subscription {
+    pub events: broadcast::Receiver<RunEvent>,
+    pub live: watch::Receiver<Vec<String>>,
 }
 
 struct ActiveRun {
     events: broadcast::Sender<RunEvent>,
+    live: watch::Receiver<Vec<String>>,
     /// Holds the email of the user who stopped the run.
     stop: watch::Sender<Option<String>>,
 }
@@ -129,8 +141,10 @@ impl Executor {
 
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let (stop, stop_receiver) = watch::channel(None);
+        let (live, live_receiver) = watch::channel(Vec::new());
         let active = ActiveRun {
             events: events.clone(),
+            live: live_receiver,
             stop,
         };
         self.lock().insert(run_id, active);
@@ -144,7 +158,9 @@ impl Executor {
             steps,
             command,
             log,
+            batch: Batch::default(),
             events,
+            live,
             stop: stop_receiver,
             output_since_step: false,
         };
@@ -177,8 +193,11 @@ impl Executor {
     }
 
     /// Events of an active run; `None` when the run is not active.
-    pub fn subscribe(&self, run_id: i64) -> Option<broadcast::Receiver<RunEvent>> {
-        self.lock().get(&run_id).map(|run| run.events.subscribe())
+    pub fn subscribe(&self, run_id: i64) -> Option<Subscription> {
+        self.lock().get(&run_id).map(|run| Subscription {
+            events: run.events.subscribe(),
+            live: run.live.clone(),
+        })
     }
 
     /// Every run that starts or ends.
@@ -223,7 +242,9 @@ struct RunTask {
     steps: Steps,
     command: String,
     log: RunLog,
+    batch: Batch,
     events: broadcast::Sender<RunEvent>,
+    live: watch::Sender<Vec<String>>,
     stop: watch::Receiver<Option<String>>,
     /// Whether the running step printed lines other than `::step` ones.
     output_since_step: bool,
@@ -371,27 +392,30 @@ impl RunTask {
             child.stderr.take().expect("stderr is piped"),
         ));
 
-        let mut splitter = LineSplitter::default();
+        let mut terminal = Terminal::default();
         let mut buffer = vec![0u8; READ_BUFFER];
         let mut stop = self.stop.clone();
         loop {
+            let due_at = self.batch.due_at().unwrap_or_else(Instant::now);
             tokio::select! {
                 read = stdout.read(&mut buffer) => match read {
                     Ok(0) | Err(_) => break,
                     Ok(count) => {
-                        let lines = splitter.push(&buffer[..count]);
-                        self.lines(lines).await;
+                        let lines = terminal.push(&buffer[..count]);
+                        self.lines(lines, terminal.open_lines()).await;
                     }
                 },
+                () = tokio::time::sleep_until(due_at), if self.batch.is_pending() => self.flush().await,
                 () = stop_requested(&mut stop) => {
                     end_process_group(&mut child).await;
+                    self.lines(terminal.finish(), Vec::new()).await;
+                    self.flush().await;
                     return Err(self.stopped());
                 }
             }
         }
-        if let Some(line) = splitter.finish() {
-            self.lines(vec![line]).await;
-        }
+        self.lines(terminal.finish(), Vec::new()).await;
+        self.flush().await;
         let status = child.wait().await;
         let stderr = stderr.await.unwrap_or_default();
         if !stderr.trim().is_empty() {
@@ -408,12 +432,12 @@ impl RunTask {
         }
     }
 
-    /// Writes lines to the output and turns `::step` lines into steps.
-    async fn lines(&mut self, lines: Vec<String>) {
-        let mut text = String::new();
+    /// Adds closed lines and the live rows to the output, and turns `::step` lines into steps.
+    /// Output before a step goes out before the step changes.
+    async fn lines(&mut self, lines: Vec<String>, live: Vec<String>) {
         for line in lines {
             if let Some(title) = steps::step_title(&line) {
-                self.append(&std::mem::take(&mut text)).await;
+                self.flush().await;
                 self.steps
                     .script_step(title, self.output_since_step, now_millis());
                 self.output_since_step = false;
@@ -422,27 +446,33 @@ impl RunTask {
             } else {
                 self.output_since_step = true;
             }
-            text.push_str(&line);
-            text.push('\n');
+            self.batch.push_line(&line);
         }
-        self.append(&text).await;
+        self.batch.set_live(live);
+        if self.batch.is_due(Instant::now()) {
+            self.flush().await;
+        }
     }
 
     /// A line of the app itself, such as the command it runs.
     async fn print(&mut self, line: &str) {
-        self.append(&format!("{line}\n")).await;
+        self.batch.push_line(line);
+        self.flush().await;
     }
 
-    async fn append(&mut self, text: &str) {
-        if text.is_empty() {
+    /// Writes the waiting output to the file and sends it as one event.
+    async fn flush(&mut self) {
+        let Some((text, live)) = self.batch.take(Instant::now()) else {
             return;
-        }
-        match self.log.append(text).await {
+        };
+        match self.log.append(&text).await {
             Ok((start, end)) => {
+                self.live.send_replace(live.clone());
                 let event = OutputEvent {
                     start,
                     end,
-                    text: text.to_owned(),
+                    text,
+                    live,
                 };
                 let _ = self.events.send(RunEvent::Output(event));
             }

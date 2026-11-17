@@ -10,8 +10,8 @@ use serde::Deserialize;
 use tokio::sync::broadcast::{Receiver, error::RecvError};
 
 use super::{AppError, AppState, Auth};
-use crate::app::runs::RunEvent;
 use crate::app::runs::output::{MAX_CHUNK, read_chunk};
+use crate::app::runs::{RunEvent, Subscription};
 use crate::app::store::{RunRecord, RunStatus};
 
 #[derive(Deserialize)]
@@ -28,8 +28,12 @@ fn run_event(run: &RunRecord) -> Event {
         .expect("a run serializes")
 }
 
-fn output_event(start: u64, end: u64, text: &str) -> Event {
-    let data = serde_json::json!({"start": start, "end": end, "text": text});
+/// Output from the file; `live` is set only for a running run's live rows.
+fn output_event(start: u64, end: u64, text: &str, live: Option<&[String]>) -> Event {
+    let mut data = serde_json::json!({"start": start, "end": end, "text": text});
+    if let Some(live) = live {
+        data["live"] = live.into();
+    }
     Event::default()
         .event("output")
         .id(end.to_string())
@@ -45,14 +49,14 @@ fn catch_up(path: &FilePath, from: u64) -> (Vec<Event>, u64) {
         if chunk.end <= offset {
             return (events, chunk.size.max(offset));
         }
-        events.push(output_event(chunk.start, chunk.end, &chunk.text));
+        events.push(output_event(chunk.start, chunk.end, &chunk.text, None));
         offset = chunk.end;
     }
     (events, offset)
 }
 
-/// A run's state, then its output from `from` (or `Last-Event-ID`), then live changes until the
-/// run ends.
+/// A run's state, then its output from `from` (or `Last-Event-ID`) with the live rows, then live
+/// changes until the run ends.
 pub async fn run_events(
     _auth: Auth,
     State(state): State<AppState>,
@@ -60,7 +64,7 @@ pub async fn run_events(
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    let receiver = state.executor.subscribe(id);
+    let subscription = state.executor.subscribe(id);
     let run = state.db.run(id)?.ok_or(AppError::NotFound("run"))?;
     let resumed = headers
         .get("last-event-id")
@@ -73,11 +77,19 @@ pub async fn run_events(
         .unwrap_or_default();
     events.insert(0, run_event(&run));
 
-    let initial = stream::iter(events.into_iter().map(Ok));
-    let live = match receiver.filter(|_| run.status == RunStatus::Running) {
-        Some(receiver) => live_events(receiver, written).boxed(),
+    let subscription = subscription.filter(|_| run.status == RunStatus::Running);
+    let live = match subscription {
+        Some(Subscription {
+            events: receiver,
+            live,
+        }) => {
+            // Read after the file, so no row is missing from both.
+            events.push(output_event(written, written, "", Some(&live.borrow())));
+            live_events(receiver, written).boxed()
+        }
         None => stream::empty().boxed(),
     };
+    let initial = stream::iter(events.into_iter().map(Ok));
     Ok(Sse::new(initial.chain(live).boxed()).keep_alive(KeepAlive::default()))
 }
 
@@ -91,7 +103,7 @@ fn live_events(
             let event = match receiver.recv().await {
                 Ok(RunEvent::Run(run)) => run_event(&run),
                 Ok(RunEvent::Output(output)) if output.start >= written => {
-                    output_event(output.start, output.end, &output.text)
+                    output_event(output.start, output.end, &output.text, Some(&output.live))
                 }
                 Ok(RunEvent::Output(_)) => continue,
                 // A slow page reconnects and resumes from its last event.

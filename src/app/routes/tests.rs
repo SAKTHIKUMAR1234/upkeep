@@ -805,6 +805,44 @@ async fn a_run_streams_steps_and_output_then_runs_check_sh() {
 }
 
 #[tokio::test]
+async fn progress_output_keeps_only_the_final_redraw() {
+    let world = World::new().await;
+    let session = world.sign_in().await;
+    let id = world.add_server(&session).await;
+    let run_sh = concat!(
+        "#!/bin/bash\n",
+        "printf '\\033[32mstart\\033[0m\\n'\n",
+        "for i in 1 2 3; do printf '\\r\\033[2K[0:0%s] %s files\\n\\r\\033[2K/file-%s\\r\\033[1A' $i $i $i; done\n",
+        "printf '\\r\\033[2K\\n\\r\\033[2K\\r\\033[1Asaved\\n'\n",
+        "printf '\\r10%%\\r50%%\\r100%%\\n'\n",
+    );
+    world
+        .create_operation(&session, id, "backup", run_sh, "#!/bin/sh\ntrue\n")
+        .await;
+    let run_id = world.start_run(&session, id, "backup").await;
+    let events = world
+        .request(
+            Method::GET,
+            &format!("/api/runs/{run_id}/events"),
+            None,
+            Some(&session),
+        )
+        .await;
+    assert_eq!(
+        world.finished_run(&session, run_id).await["status"],
+        "succeeded"
+    );
+
+    let output = world.output(&session, run_id).await;
+    assert!(
+        output.contains("/run.sh'\nstart\nsaved\n100%\n$ sudo"),
+        "{output:?}"
+    );
+    let text = events.text().await.unwrap();
+    assert!(text.contains(r#""live":[]"#), "{text}");
+}
+
+#[tokio::test]
 async fn failing_scripts_restarts_busy_servers_and_stops() {
     let world = World::new().await;
     let session = world.sign_in().await;

@@ -4,9 +4,12 @@ use std::path::Path;
 
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
+use tokio::time::{Duration, Instant};
 
 /// The most output one read returns.
 pub const MAX_CHUNK: u64 = 1024 * 1024;
+/// The shortest time between two output events of a run.
+pub const BATCH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The output file of a run, `<data>/runs/<id>.log`, readable by its owner only.
 pub struct RunLog {
@@ -30,12 +33,62 @@ impl RunLog {
 
     /// Appends text and returns the byte range it took in the file.
     pub async fn append(&mut self, text: &str) -> std::io::Result<(u64, u64)> {
+        if text.is_empty() {
+            return Ok((self.size, self.size));
+        }
         self.file.write_all(text.as_bytes()).await?;
         // Readers of the file must see every line that an event announces.
         self.file.flush().await?;
         let start = self.size;
         self.size += text.len() as u64;
         Ok((start, self.size))
+    }
+}
+
+/// Output that waits for the next event, so a busy terminal sends a few events a second.
+#[derive(Debug, Default)]
+pub struct Batch {
+    text: String,
+    live: Vec<String>,
+    live_changed: bool,
+    sent_at: Option<Instant>,
+}
+
+impl Batch {
+    pub fn push_line(&mut self, line: &str) {
+        self.text.push_str(line);
+        self.text.push('\n');
+    }
+
+    /// The rows the terminal may still redraw.
+    pub fn set_live(&mut self, live: Vec<String>) {
+        if live != self.live {
+            self.live = live;
+            self.live_changed = true;
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        !self.text.is_empty() || self.live_changed
+    }
+
+    /// When the waiting output may go out.
+    pub fn due_at(&self) -> Option<Instant> {
+        self.sent_at.map(|sent_at| sent_at + BATCH_INTERVAL)
+    }
+
+    pub fn is_due(&self, now: Instant) -> bool {
+        self.is_pending() && self.due_at().is_none_or(|due_at| now >= due_at)
+    }
+
+    /// The waiting text and the live rows, or `None` when nothing changed.
+    pub fn take(&mut self, now: Instant) -> Option<(String, Vec<String>)> {
+        if !self.is_pending() {
+            return None;
+        }
+        self.sent_at = Some(now);
+        self.live_changed = false;
+        Some((std::mem::take(&mut self.text), self.live.clone()))
     }
 }
 
@@ -132,5 +185,37 @@ mod tests {
             std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn a_batch_joins_output_until_its_interval_passes() {
+        let start = Instant::now();
+        let mut batch = Batch::default();
+        assert!(!batch.is_due(start));
+        assert_eq!(batch.take(start), None);
+
+        batch.push_line("first");
+        assert!(batch.is_due(start), "the first output goes out at once");
+        assert_eq!(batch.take(start), Some(("first\n".into(), vec![])));
+
+        let soon = start + BATCH_INTERVAL / 2;
+        for percent in 0..100 {
+            batch.set_live(vec![format!("{percent}%")]);
+        }
+        batch.push_line("second");
+        batch.push_line("third");
+        assert!(!batch.is_due(soon));
+        assert_eq!(batch.due_at(), Some(start + BATCH_INTERVAL));
+
+        let later = start + BATCH_INTERVAL;
+        assert!(batch.is_due(later));
+        assert_eq!(
+            batch.take(later),
+            Some(("second\nthird\n".into(), vec!["99%".into()]))
+        );
+        batch.set_live(vec!["99%".into()]);
+        assert!(!batch.is_pending(), "unchanged live rows send nothing");
+        batch.set_live(vec![]);
+        assert_eq!(batch.take(later), Some((String::new(), vec![])));
     }
 }

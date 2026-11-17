@@ -145,10 +145,16 @@ svg.i { width: 16px; height: 16px; flex: none; }
 .hint { font-size: .76rem; color: var(--muted); font-weight: 400; }
 .steps-hint { padding: 0 16px 14px; }
 .run-detail { padding: 0 16px 14px; }
-.term { background: var(--term); color: var(--term-fg); font-family: var(--mono); font-size: .76rem; line-height: 1.6; padding: 12px 14px; border-radius: 0 0 10px 10px; height: calc(100vh - 230px); min-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.term { background: var(--term); color: var(--term-fg); font-family: var(--mono); font-size: .76rem; line-height: 1.6; padding: 12px 14px; border-radius: 0 0 10px 10px; height: calc(100vh - 230px); min-height: 260px; overflow-y: scroll; scrollbar-gutter: stable; contain: content; white-space: pre-wrap; word-break: break-word; }
+.term::-webkit-scrollbar { width: 10px; }
+.term::-webkit-scrollbar-track { background: transparent; }
+.term::-webkit-scrollbar-thumb { background: #334155; border-radius: 5px; border: 2px solid var(--term); }
 .term .ln { min-height: 1.6em; }
 .term .g { color: #4ade80; } .term .y { color: #facc15; } .term .c { color: #67e8f9; } .term .d { color: #6b7280; } .term .r { color: #f87171; }
-.term .more { display: block; margin: 0 0 8px; color: #93c5fd; background: none; border: 1px dashed #334155; border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; }
+.term .earlier { margin: 0 0 8px; padding: 4px 10px; border: 1px dashed #334155; border-radius: 6px; color: #94a3b8; }
+.term .earlier button { color: #93c5fd; background: none; border: 0; padding: 0; cursor: pointer; font: inherit; }
+.term .earlier button:hover { text-decoration: underline; }
+.term .cursor-row { min-height: 1.6em; }
 .cursor { color: #4ade80; animation: blink 1s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 

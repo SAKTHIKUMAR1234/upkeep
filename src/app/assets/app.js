@@ -4,7 +4,8 @@
 
 const IDLE_MS = 15 * 60 * 1000;
 const OUTPUT_TAIL = 256 * 1024;
-const MAX_TERMINAL_LINES = 5000;
+const MAX_TERMINAL_LINES = 2000;
+const UTF8 = new TextEncoder();
 
 const ICONS = {
   grid: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
@@ -830,6 +831,20 @@ function terminalLine(text) {
 
 const STEP_MARKS = { ok: '✓', failed: '✗', stopped: '■' };
 
+/** The size of `lines` in the output file, with their newlines. */
+function byteLength(lines) {
+  return lines.reduce((total, line) => total + UTF8.encode(line).length + 1, 0);
+}
+
+/** The last `limit` lines of an output chunk and the byte where they start. With `cut`, the
+ * chunk may start inside a line, so its first line is dropped. */
+function chunkLines(chunk, limit, cut) {
+  const lines = chunk.text.split('\n');
+  if (lines[lines.length - 1] === '') lines.pop();
+  const skip = Math.max(cut && lines.length > 1 ? 1 : 0, lines.length - limit);
+  return { start: chunk.start + byteLength(lines.slice(0, skip)), lines: lines.slice(skip) };
+}
+
 function runView(id) {
   const status = h('span', { class: 'badge b-gray', role: 'status' }, 'Loading…');
   const stop = button('Stop', { kind: 'dng', icon: 'stop' });
@@ -838,7 +853,14 @@ function runView(id) {
   const by = h('span', { class: 'ph-note' });
   const steps = h('ol', { class: 'steps', 'aria-label': 'Steps' });
   const detail = h('p', { class: 'hint run-detail' });
-  const terminal = h('div', { class: 'term', role: 'log', 'aria-label': 'Output', tabindex: '0' });
+  const shownCount = h('span');
+  const earlier = h('div', { class: 'earlier', hidden: true }, shownCount, ' · ',
+    h('button', { type: 'button', onclick: () => loadEarlier() }, '↑ Load earlier'), ' · ',
+    h('button', { type: 'button', onclick: () => openFullLog() }, 'Open full log'));
+  const lines = h('div');
+  const live = h('div');
+  const cursor = h('div', { class: 'cursor-row', 'aria-hidden': 'true' }, h('span', { class: 'cursor' }, '▌'));
+  const terminal = h('div', { class: 'term', role: 'log', 'aria-label': 'Output', tabindex: '0' }, earlier, lines, live);
   const follow = button('Follow ↓', { size: 'sm', pressed: 'true' });
   const copy = button('Copy', { size: 'sm', icon: 'copy' });
   const el = [topBar(crumb, `Run #${id}`, [status, stop]), h('div', { class: 'content' }, h('div', { class: 'split' },
@@ -847,13 +869,15 @@ function runView(id) {
     h('div', { class: 'panel' }, h('div', { class: 'ph' }, h('h3', {}, 'Output'), h('div', { class: 'row' }, copy, follow)), terminal)))];
 
   let run = null;
-  let have = 0;
-  let start = 0;
+  let have = 0; // The output byte the view has, without the live rows.
+  let start = 0; // The output byte of the first shown line.
+  let shown = 0;
   let source = null;
   let ticker = null;
   let following = true;
-  let partial = '';
-  const cursor = h('span', { class: 'cursor', 'aria-hidden': 'true' }, '▌');
+  let queuedText = '';
+  let queuedLive = null;
+  let frame = 0;
 
   follow.addEventListener('click', () => {
     following = !following;
@@ -875,17 +899,48 @@ function runView(id) {
     onConfirm: async () => { await api('POST', `/runs/${id}/stop`); },
   }));
 
-  function writeText(text) {
-    const lines = (partial + text).split('\n');
-    partial = lines.pop();
-    cursor.remove();
-    const fragment = document.createDocumentFragment();
-    for (const line of lines) fragment.append(terminalLine(line));
-    terminal.append(fragment);
-    const all = terminal.querySelectorAll('.ln');
-    for (let index = 0; index < all.length - MAX_TERMINAL_LINES; index += 1) all[index].remove();
-    if (run && run.status === 'running') terminal.append(cursor);
+  /** Queues output for the next frame, so a busy run draws at most once a frame. */
+  function queue(text, liveRows) {
+    queuedText += text;
+    if (liveRows) queuedLive = liveRows;
+    if (!frame) frame = requestAnimationFrame(draw);
+  }
+
+  function draw() {
+    frame = 0;
+    const added = queuedText.split('\n');
+    if (added[added.length - 1] === '') added.pop();
+    queuedText = '';
+    if (added.length) {
+      const fragment = document.createDocumentFragment();
+      for (const line of added) fragment.append(terminalLine(line));
+      lines.append(fragment);
+      shown += added.length;
+      if (following) trim();
+      drawEarlier();
+    }
+    if (queuedLive) {
+      live.replaceChildren(...queuedLive.map(terminalLine));
+      queuedLive = null;
+    }
     if (following) terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  /** Keeps the newest lines only; the older ones stay in the log. */
+  function trim() {
+    if (shown <= MAX_TERMINAL_LINES) return;
+    const removed = [];
+    while (shown > MAX_TERMINAL_LINES) {
+      removed.push(lines.firstChild.textContent);
+      lines.firstChild.remove();
+      shown -= 1;
+    }
+    start += byteLength(removed);
+  }
+
+  function drawEarlier() {
+    earlier.hidden = start === 0;
+    shownCount.textContent = `Showing the last ${shown} lines`;
   }
 
   function drawRun() {
@@ -910,32 +965,49 @@ function runView(id) {
       cursor.remove();
       clearInterval(ticker);
       ticker = null;
-    } else if (!ticker) {
-      ticker = setInterval(drawRun, 1000); // Redraws the elapsed time only; no request.
+    } else {
+      if (!cursor.isConnected) terminal.append(cursor);
+      if (!ticker) ticker = setInterval(drawRun, 1000); // Redraws the elapsed time only; no request.
     }
   }
 
   async function loadEarlier() {
     try {
-      const chunk = await api('GET', `/runs/${id}/output${query({ offset: Math.max(0, start - OUTPUT_TAIL), limit: start - Math.max(0, start - OUTPUT_TAIL) })}`);
+      const from = Math.max(0, start - OUTPUT_TAIL);
+      const chunk = await api('GET', `/runs/${id}/output${query({ offset: from, limit: start - from })}`);
+      const part = chunkLines(chunk, Infinity, from > 0);
       const fragment = document.createDocumentFragment();
-      const lines = chunk.text.split('\n');
-      if (lines[lines.length - 1] === '') lines.pop();
-      for (const line of lines) fragment.append(terminalLine(line));
-      start = chunk.start;
-      terminal.querySelector('.more')?.remove();
-      terminal.prepend(fragment);
-      if (start > 0) terminal.prepend(moreButton());
+      for (const line of part.lines) fragment.append(terminalLine(line));
+      const height = terminal.scrollHeight;
+      lines.prepend(fragment);
+      start = part.start;
+      shown += part.lines.length;
+      drawEarlier();
       following = false;
       follow.setAttribute('aria-pressed', 'false');
-      terminal.scrollTop = 0;
+      terminal.scrollTop += terminal.scrollHeight - height;
     } catch (failure) {
       toast(failure.message, true);
     }
   }
 
-  function moreButton() {
-    return h('button', { type: 'button', class: 'more', onclick: loadEarlier }, '↑ Load earlier output');
+  /** Reads the whole log in chunks and opens it as plain text. */
+  async function openFullLog() {
+    try {
+      const parts = [];
+      let offset = 0;
+      for (;;) {
+        const chunk = await api('GET', `/runs/${id}/output${query({ offset })}`);
+        parts.push(chunk.text);
+        if (chunk.end >= chunk.size || chunk.end === chunk.start) break;
+        offset = chunk.end;
+      }
+      const url = URL.createObjectURL(new Blob(parts, { type: 'text/plain;charset=utf-8' }));
+      if (!window.open(url, '_blank')) h('a', { href: url, download: `run-${id}.log` }).click();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (failure) {
+      toast(failure.message, true);
+    }
   }
 
   function listen() {
@@ -949,7 +1021,7 @@ function runView(id) {
       const chunk = JSON.parse(event.data);
       if (chunk.start < have) return;
       have = chunk.end;
-      writeText(chunk.text);
+      queue(chunk.text, chunk.live);
     });
   }
 
@@ -957,16 +1029,16 @@ function runView(id) {
     try {
       run = await api('GET', `/runs/${id}`);
       const chunk = await api('GET', `/runs/${id}/output${query({ tail: OUTPUT_TAIL })}`);
-      start = chunk.start;
+      const part = chunkLines(chunk, MAX_TERMINAL_LINES, false);
+      start = part.start;
       have = chunk.end;
-      if (start > 0) terminal.append(moreButton());
       drawRun();
-      writeText(chunk.text);
+      queue(part.lines.map((line) => `${line}\n`).join(''));
       if (run.status === 'running') listen();
     } catch (failure) {
       status.className = 'badge b-bad';
       status.textContent = 'Error';
-      terminal.replaceChildren(h('div', { class: 'ln r' }, failure.message));
+      lines.replaceChildren(h('div', { class: 'ln r' }, failure.message));
     }
   }
 
@@ -975,6 +1047,7 @@ function runView(id) {
     el,
     destroy() {
       if (source) source.close();
+      cancelAnimationFrame(frame);
       clearInterval(ticker);
     },
   };

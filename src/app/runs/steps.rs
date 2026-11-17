@@ -1,8 +1,6 @@
 use crate::app::store::{Step, StepStatus};
 
 const STEP_PREFIX: &str = "::step ";
-/// Output lines longer than this are cut into several lines.
-const MAX_LINE: usize = 16 * 1024;
 
 pub const CONNECT: &str = "Connect over SSH";
 pub const RUN_SCRIPT: &str = "run.sh";
@@ -100,43 +98,6 @@ impl Steps {
     }
 }
 
-/// Cuts a byte stream into lines. Drops `\r` before `\n`, as a remote terminal sends it.
-#[derive(Debug, Default)]
-pub struct LineSplitter {
-    partial: Vec<u8>,
-}
-
-impl LineSplitter {
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        let mut lines = Vec::new();
-        for &byte in bytes {
-            if byte == b'\n' {
-                lines.push(self.take());
-            } else {
-                self.partial.push(byte);
-                if self.partial.len() >= MAX_LINE {
-                    lines.push(self.take());
-                }
-            }
-        }
-        lines
-    }
-
-    /// The last line when the stream ended without a newline.
-    pub fn finish(&mut self) -> Option<String> {
-        (!self.partial.is_empty()).then(|| self.take())
-    }
-
-    fn take(&mut self) -> String {
-        if self.partial.last() == Some(&b'\r') {
-            self.partial.pop();
-        }
-        let line = String::from_utf8_lossy(&self.partial).into_owned();
-        self.partial.clear();
-        line
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,18 +178,5 @@ mod tests {
                 ("Later step", StepStatus::Running)
             ]
         );
-    }
-
-    #[test]
-    fn lines_split_across_chunks_and_lose_carriage_returns() {
-        let mut splitter = LineSplitter::default();
-        assert_eq!(splitter.push(b"one\r\ntw"), ["one"]);
-        assert_eq!(splitter.push(b"o\n\nthree"), ["two", ""]);
-        assert_eq!(splitter.finish().as_deref(), Some("three"));
-        assert_eq!(splitter.finish(), None);
-        let long = vec![b'x'; MAX_LINE + 10];
-        let lines = splitter.push(&long);
-        assert_eq!(lines.len(), 1);
-        assert_eq!(splitter.finish().unwrap().len(), 10);
     }
 }
