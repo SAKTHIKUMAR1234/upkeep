@@ -188,3 +188,52 @@ async fn client_drives_a_registered_host_over_tcp() {
     assert!(upkeep(&["host", "remove", "vm-a"]).0);
     assert!(!upkeep(&["--host", "vm-a", "jobs"]).0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plans_list_titles_and_steps_in_plain_words() {
+    let mut harness = Harness::new();
+    harness.add_plan("broken", "steps = [\"nope:verify\"]\n");
+    harness.start().await;
+
+    let listing = harness.client().get("/plans").await.unwrap();
+    let plans = listing["plans"].as_array().unwrap();
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans[0]["name"], "broken");
+    assert!(
+        plans[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown adapter")
+    );
+
+    let update = &plans[1];
+    assert_eq!(
+        (&update["name"], &update["title"], &update["confirm"]),
+        (&"os-update".into(), &"OS update".into(), &true.into())
+    );
+    assert_eq!(
+        update["steps"],
+        serde_json::json!([
+            "Maintenance on",
+            "Backup",
+            "Snapshot",
+            "Uploading the snapshot",
+            "Install updates",
+            "Check services (demo-app)",
+            "Check services (Demo server)",
+            "Maintenance off"
+        ])
+    );
+    assert_eq!(update["on_failure"][0], "Restore");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn job_detail_gives_plain_titles() {
+    let mut harness = Harness::new();
+    harness.start().await;
+
+    let id = harness.run("demo-app:verify", false).await.unwrap();
+    let detail = harness.wait_for_status(id, "succeeded").await;
+    assert_eq!(detail["title"], "demo-app:verify");
+    assert_eq!(detail["steps"][0]["title"], "Check services");
+}

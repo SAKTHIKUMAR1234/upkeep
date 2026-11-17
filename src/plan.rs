@@ -92,6 +92,20 @@ impl Plan {
     }
 }
 
+/// The names of the plan files in `plans_dir`, sorted. A missing folder has no plans.
+pub fn names(plans_dir: &Path) -> Vec<String> {
+    let entries = std::fs::read_dir(plans_dir).into_iter().flatten().flatten();
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| {
+            let file_name = entry.file_name().into_string().ok()?;
+            let name = file_name.strip_suffix(".toml")?;
+            is_valid_name(name).then(|| name.to_owned())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// A job gets a Telegram message when it runs a plan that does not set `notify = false`.
 /// A single `adapter:action` is not announced.
 pub fn notifies(target: &str, plans_dir: &Path) -> bool {
@@ -342,6 +356,16 @@ mod tests {
             JobPlan::resolve("missing", &catalog(), dir.path()).unwrap_err(),
             PlanError::UnknownPlan("missing".into())
         );
+    }
+
+    #[test]
+    fn names_lists_valid_plan_files_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["os-update.toml", "bench.toml", "notes.txt", "bad name.toml"] {
+            std::fs::write(dir.path().join(file), "steps = []\n").unwrap();
+        }
+        assert_eq!(super::names(dir.path()), ["bench", "os-update"]);
+        assert!(super::names(&dir.path().join("missing")).is_empty());
     }
 
     #[test]

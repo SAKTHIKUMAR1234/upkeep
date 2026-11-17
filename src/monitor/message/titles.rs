@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::adapter::Catalog;
-use crate::plan::Plan;
+use crate::plan::{Plan, StepSpec};
 use crate::store::Step;
 
 /// Plain names for common actions, used when `adapter.toml` gives the action no title.
@@ -56,30 +56,61 @@ impl Titles {
         titles
     }
 
+    /// For example "OS update" from the title, or "Os update" from the plan name "os-update".
+    pub fn plan_title(&self, target: &str) -> String {
+        match &self.plan {
+            Some(title) => title.clone(),
+            None => super::capitalize(&words(target)),
+        }
+    }
+
     /// For example "OS UPDATE" from the title "OS update" or the plan name "os-update".
     pub fn plan_label(&self, target: &str) -> String {
-        match &self.plan {
-            Some(title) => title.to_uppercase(),
-            None => words(target).to_uppercase(),
-        }
+        self.plan_title(target).to_uppercase()
     }
 
     /// The step's title. When another step of the same phase has the same title, the adapter's name follows.
     pub fn step(&self, step: &Step, steps: &[Step]) -> String {
-        let title = self.action(&step.adapter, &step.action);
-        let shared = steps.iter().any(|other| {
-            other.phase == step.phase
-                && other.adapter != step.adapter
-                && self.action(&other.adapter, &other.action) == title
+        let phase = steps.iter().filter(|other| other.phase == step.phase);
+        self.unique(
+            &step.adapter,
+            &step.action,
+            phase.map(|other| (other.adapter.as_str(), other.action.as_str())),
+        )
+    }
+
+    /// The titles of one list of resolved steps, such as the main steps of a plan.
+    pub fn specs(&self, specs: &[StepSpec]) -> Vec<String> {
+        let pairs = || {
+            specs
+                .iter()
+                .map(|spec| (spec.adapter.as_str(), spec.action.as_str()))
+        };
+        specs
+            .iter()
+            .map(|spec| self.unique(&spec.adapter, &spec.action, pairs()))
+            .collect()
+    }
+
+    /// The action's title, followed by the adapter's name when another adapter in `list` has the same title.
+    fn unique<'a>(
+        &self,
+        adapter: &str,
+        action: &str,
+        mut list: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> String {
+        let title = self.action(adapter, action);
+        let shared = list.any(|(other_adapter, other_action)| {
+            other_adapter != adapter && self.action(other_adapter, other_action) == title
         });
         if !shared {
             return title;
         }
         let adapter = self
             .adapters
-            .get(&step.adapter)
+            .get(adapter)
             .cloned()
-            .unwrap_or_else(|| step.adapter.clone());
+            .unwrap_or_else(|| adapter.to_owned());
         format!("{title} ({adapter})")
     }
 
@@ -170,6 +201,27 @@ mod tests {
         };
         assert_eq!(titled.plan_label("os-update"), "OS UPDATE");
         assert_eq!(Titles::default().plan_label("bench_update"), "BENCH UPDATE");
+        assert_eq!(Titles::default().plan_title("bench_update"), "Bench update");
+    }
+
+    #[test]
+    fn spec_titles_name_the_adapter_when_shared() {
+        let spec = |adapter: &str, action: &str| StepSpec {
+            adapter: adapter.into(),
+            action: action.into(),
+            adapter_dir: Default::default(),
+            run: String::new(),
+            timeout: std::time::Duration::from_secs(1),
+        };
+        let specs = [
+            spec("os", "snapshot"),
+            spec("app", "verify"),
+            spec("os", "verify"),
+        ];
+        assert_eq!(
+            Titles::default().specs(&specs),
+            ["Snapshot", "Check services (app)", "Check services (os)"]
+        );
     }
 
     #[test]

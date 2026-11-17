@@ -12,9 +12,11 @@ use serde_json::{Value, json};
 
 use super::auth::{Token, require_token};
 use super::log_stream;
-use crate::adapter::health;
+use crate::adapter::{Catalog, health};
 use crate::engine::{RunError, RunRequest, Runner};
+use crate::monitor::message::titles::Titles;
 use crate::monitor::{Monitor, MonitorError};
+use crate::plan::{self, JobPlan};
 use crate::store::StoreError;
 
 #[derive(Clone)]
@@ -47,6 +49,7 @@ fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/adapters", get(adapters))
+        .route("/plans", get(plans))
         .route("/run", post(run))
         .route("/jobs", get(jobs))
         .route("/jobs/{id}", get(job))
@@ -95,6 +98,29 @@ async fn adapters(State(state): State<ApiState>) -> Json<Value> {
     Json(json!({"adapters": adapters, "errors": catalog.errors}))
 }
 
+/// Every plan on this server with its plain title and step titles.
+async fn plans(State(state): State<ApiState>) -> Json<Value> {
+    let catalog = state.runner.catalog();
+    let dir = state.runner.paths().plans_dir();
+    let plans: Vec<Value> = plan::names(&dir)
+        .iter()
+        .map(|name| plan_summary(name, &catalog, &dir))
+        .collect();
+    Json(json!({"plans": plans}))
+}
+
+fn plan_summary(name: &str, catalog: &Catalog, dir: &std::path::Path) -> Value {
+    let titles = Titles::load(name, catalog, dir);
+    let title = titles.plan_title(name);
+    match JobPlan::resolve(name, catalog, dir) {
+        Ok(plan) => json!({
+            "name": name, "title": title, "confirm": plan.confirm,
+            "steps": titles.specs(&plan.steps), "on_failure": titles.specs(&plan.recovery),
+        }),
+        Err(error) => json!({"name": name, "title": title, "error": error.to_string()}),
+    }
+}
+
 async fn run(
     State(state): State<ApiState>,
     Json(request): Json<RunRequest>,
@@ -116,10 +142,27 @@ async fn jobs(
     Ok(Json(json!({"jobs": jobs})))
 }
 
+/// The job and its steps, each with its plain title.
 async fn job(State(state): State<ApiState>, Path(id): Path<i64>) -> Result<Json<Value>, ApiError> {
     let store = state.runner.store();
     let job = store.job(id)?;
-    Ok(Json(json!({"job": job, "steps": store.steps(id)?})))
+    let steps = store.steps(id)?;
+    let plans_dir = state.runner.paths().plans_dir();
+    let titles = Titles::load(&job.target, &state.runner.catalog(), &plans_dir);
+    let titled: Vec<Value> = steps
+        .iter()
+        .map(|step| {
+            let mut value = json!(step);
+            value["title"] = json!(titles.step(step, &steps));
+            value
+        })
+        .collect();
+    let title = if job.target.contains(':') {
+        job.target.clone()
+    } else {
+        titles.plan_title(&job.target)
+    };
+    Ok(Json(json!({"job": job, "title": title, "steps": titled})))
 }
 
 #[derive(Deserialize)]
