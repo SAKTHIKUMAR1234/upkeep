@@ -9,22 +9,26 @@ mod session;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod website_tests;
 
 use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{DefaultBodyLimit, FromRequestParts};
 use axum::http::request::Parts;
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use serde_json::json;
 use tokio::sync::Semaphore;
 
-use super::auth::session::{SessionState, has_csrf, read_cookie, state};
+use super::auth::session::{Cookies, SessionState, has_csrf, read_cookie, state};
+use super::auth::throttle::IpThrottle;
 use super::operations::OperationError;
 use super::runs::ssh::SshError;
 use super::runs::{Executor, RunError};
+use super::serve::ServeConfig;
 use super::store::{Activity, Db, Server, StoreError};
 use crate::time::now_millis;
 
@@ -35,17 +39,30 @@ pub struct AppState {
     pub executor: Arc<Executor>,
     /// The port the service listens on, for the host and origin guard.
     pub port: u16,
+    pub serve: Arc<ServeConfig>,
     /// Limits parallel password checks: each one takes 64 MiB.
     pub hashing: Arc<Semaphore>,
+    /// Failed sign-ins per client address, on a website only: on the loopback address every
+    /// client has the same address.
+    pub throttle: Option<Arc<IpThrottle>>,
 }
 
 impl AppState {
-    pub fn new(db: Arc<Db>, executor: Arc<Executor>, port: u16) -> Self {
+    pub fn new(db: Arc<Db>, executor: Arc<Executor>, port: u16, serve: ServeConfig) -> Self {
         Self {
             db,
             executor,
             port,
+            throttle: serve.is_website().then(Arc::default),
+            serve: Arc::new(serve),
             hashing: Arc::new(Semaphore::new(2)),
+        }
+    }
+
+    pub fn cookies(&self) -> Cookies {
+        Cookies {
+            secure: self.serve.is_website(),
+            limits: self.serve.sessions,
         }
     }
 
@@ -69,6 +86,8 @@ pub fn router(state: AppState) -> Router {
                 .post(session::sign_in)
                 .delete(session::sign_out),
         )
+        .route("/session/ping", post(session::ping))
+        .route("/session/lock", post(session::lock))
         .route("/overview", get(servers::overview))
         .route("/ssh-keys", get(servers::ssh_keys))
         .route("/servers", get(servers::list).post(servers::add))
@@ -99,7 +118,8 @@ pub fn router(state: AppState) -> Router {
         .route("/events", get(events::changes))
         .route("/filters", get(activity::filters))
         .route("/activity", get(activity::list))
-        .fallback(|| async { AppError::NotFound("route") });
+        .fallback(|| async { AppError::NotFound("route") })
+        .layer(DefaultBodyLimit::max(MAX_BODY));
     Router::new()
         .route("/", get(assets::index))
         .route("/assets/{file}", get(assets::file))
@@ -108,28 +128,32 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Marks a request the page sends by itself, such as a refresh after an event.
+pub const BACKGROUND_HEADER: &str = "x-upkeep-background";
+
+/// The largest JSON body the API reads.
+const MAX_BODY: usize = 1024 * 1024;
+
 /// A signed-in user, checked on every request: a live session, and the CSRF header on every
-/// request that changes something.
+/// request that changes something. The request counts as use of the session, unless the page
+/// marks it with [`BACKGROUND_HEADER`] because it sent it without user input.
 pub struct Auth {
     pub email: String,
     pub token: String,
 }
 
-impl FromRequestParts<AppState> for Auth {
-    type Rejection = AppError;
-
-    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, AppError> {
+impl Auth {
+    fn check(parts: &Parts, app: &AppState, now: i64) -> Result<Self, AppError> {
         let token = read_cookie(&parts.headers).ok_or(AppError::SignedOut)?;
         let session = app.db.session(token)?.ok_or(AppError::SignedOut)?;
-        let now = now_millis();
-        match state(&session, now) {
+        match state(&session, now, app.serve.sessions) {
             SessionState::Live => {}
-            ended => {
+            // The row stays, so every request of the idle session answers the same until a
+            // sign-in removes it.
+            SessionState::Idle => return Err(AppError::Locked),
+            SessionState::Expired => {
                 app.db.delete_session(token)?;
-                return Err(match ended {
-                    SessionState::Idle => AppError::Locked,
-                    _ => AppError::SignedOut,
-                });
+                return Err(AppError::SignedOut);
             }
         }
         if !matches!(parts.method, Method::GET | Method::HEAD)
@@ -137,11 +161,35 @@ impl FromRequestParts<AppState> for Auth {
         {
             return Err(AppError::Csrf);
         }
-        app.db.touch_session(token, now)?;
         Ok(Self {
             email: session.email,
             token: token.to_owned(),
         })
+    }
+}
+
+impl FromRequestParts<AppState> for Auth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, AppError> {
+        let now = now_millis();
+        let auth = Self::check(parts, app, now)?;
+        if !parts.headers.contains_key(BACKGROUND_HEADER) {
+            app.db.touch_session(&auth.token, now)?;
+        }
+        Ok(auth)
+    }
+}
+
+/// A signed-in user of an event stream: checked like [`Auth`], but an open stream is not use, so
+/// it does not keep the session alive.
+pub struct StreamAuth(pub Auth);
+
+impl FromRequestParts<AppState> for StreamAuth {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &AppState) -> Result<Self, AppError> {
+        Auth::check(parts, app, now_millis()).map(Self)
     }
 }
 
@@ -150,7 +198,7 @@ impl FromRequestParts<AppState> for Auth {
 pub enum AppError {
     #[error("Sign in first.")]
     SignedOut,
-    #[error("The app locked after 15 minutes without use. Enter your password.")]
+    #[error("Upkeep locked because it was not used. Enter your password.")]
     Locked,
     #[error("Missing or wrong X-CSRF-Token header.")]
     Csrf,
@@ -160,6 +208,8 @@ pub enum AppError {
     BadSignIn,
     #[error("Too many failed sign-ins. Try again in {}.", wait_text(*.0))]
     TooManyAttempts(i64),
+    #[error("The request took too long.")]
+    Timeout,
     #[error("{0}")]
     Invalid(String),
     #[error("No such {0}.")]
@@ -197,6 +247,7 @@ impl AppError {
             Self::BadSignIn => (StatusCode::UNAUTHORIZED, "bad_sign_in"),
             Self::Csrf | Self::ForeignOrigin => (StatusCode::FORBIDDEN, "forbidden"),
             Self::TooManyAttempts(_) => (StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"),
+            Self::Timeout => (StatusCode::SERVICE_UNAVAILABLE, "timeout"),
             Self::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
@@ -234,6 +285,13 @@ impl IntoResponse for AppError {
         } else {
             self.to_string()
         };
-        (status, Json(json!({"error": message, "code": code}))).into_response()
+        let mut response = (status, Json(json!({"error": message, "code": code}))).into_response();
+        if let Self::TooManyAttempts(wait) = self {
+            let seconds = (wait + 999) / 1000;
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
     }
 }

@@ -110,11 +110,30 @@ fn files_text(scripts: &Scripts) -> &'static str {
     }
 }
 
+/// Runs a change on a server to the end, even when the request ends first (a closed connection
+/// or the website's time limit), so the database and the activity log match the server.
+async fn to_the_end<T: Send + 'static>(
+    change: impl Future<Output = Result<T, AppError>> + Send + 'static,
+) -> Result<T, AppError> {
+    tokio::spawn(change)
+        .await
+        .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))
+}
+
 pub async fn create(
     auth: Auth,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Json(body): Json<NewOperation>,
+) -> Result<Response, AppError> {
+    to_the_end(create_operation(auth, state, id, body)).await
+}
+
+async fn create_operation(
+    auth: Auth,
+    state: AppState,
+    id: i64,
+    body: NewOperation,
 ) -> Result<Response, AppError> {
     let server = state.server(id)?;
     let title = checked_title(&body.title)?;
@@ -181,6 +200,16 @@ pub async fn edit(
     Path((id, folder)): Path<(i64, String)>,
     Json(body): Json<EditOperation>,
 ) -> Result<Json<Value>, AppError> {
+    to_the_end(edit_operation(auth, state, id, folder, body)).await
+}
+
+async fn edit_operation(
+    auth: Auth,
+    state: AppState,
+    id: i64,
+    folder: String,
+    body: EditOperation,
+) -> Result<Json<Value>, AppError> {
     let server = state.server(id)?;
     let folder = checked_folder(&folder)?;
     let title = body.title.as_deref().map(checked_title).transpose()?;
@@ -222,6 +251,15 @@ pub async fn delete(
     auth: Auth,
     State(state): State<AppState>,
     Path((id, folder)): Path<(i64, String)>,
+) -> Result<StatusCode, AppError> {
+    to_the_end(delete_operation(auth, state, id, folder)).await
+}
+
+async fn delete_operation(
+    auth: Auth,
+    state: AppState,
+    id: i64,
+    folder: String,
 ) -> Result<StatusCode, AppError> {
     let server = state.server(id)?;
     let folder = checked_folder(&folder)?;

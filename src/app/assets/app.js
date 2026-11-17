@@ -2,7 +2,10 @@
 
 /* ---------- Small helpers ---------- */
 
-const IDLE_MS = 15 * 60 * 1000;
+/** The page tells the service about use at most this often. */
+const PING_MS = 60 * 1000;
+/** Mouse moves count as input at most this often. */
+const MOUSEMOVE_MS = 5 * 1000;
 const OUTPUT_TAIL = 256 * 1024;
 const MAX_TERMINAL_LINES = 2000;
 const UTF8 = new TextEncoder();
@@ -156,22 +159,31 @@ class ApiError extends Error {
   }
 }
 
-const session = { email: null, csrf: null };
+const session = { email: null, csrf: null, idleMs: 15 * 60 * 1000 };
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+/** The email of the last sign-in, from the cookie the service sets. Only fills the lock screen. */
 function storedEmail() {
-  try { return sessionStorage.getItem('upkeep-email'); } catch { return null; }
-}
-
-function storeEmail(email) {
+  const pair = document.cookie.split('; ').find((cookie) => cookie.startsWith('upkeep_email='));
+  if (!pair) return null;
   try {
-    if (email) sessionStorage.setItem('upkeep-email', email);
-    else sessionStorage.removeItem('upkeep-email');
-  } catch { /* Storage is a convenience only. */ }
+    const email = decodeURIComponent(pair.slice('upkeep_email='.length));
+    return email.length <= 254 && EMAIL_PATTERN.test(email) ? email : null;
+  } catch {
+    return null;
+  }
 }
 
-async function api(method, path, body) {
+function forgetEmail() {
+  const secure = location.protocol === 'https:' ? '; Secure' : '';
+  document.cookie = `upkeep_email=; Max-Age=0; Path=/; SameSite=Strict${secure}`;
+}
+
+/** A request with `background` comes from the page, not from user input, so it does not keep the session alive. */
+async function api(method, path, body, { background = false } = {}) {
   const headers = { Accept: 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (background) headers['X-Upkeep-Background'] = '1';
   if (method !== 'GET' && session.csrf) headers['X-CSRF-Token'] = session.csrf;
   let response;
   try {
@@ -183,7 +195,7 @@ async function api(method, path, body) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new ApiError(data.error || `Request failed (${response.status})`, response.status, data.code);
-    if (response.status === 401 && path !== '/session') sessionEnded(error.code);
+    if (response.status === 401 && path !== '/session') sessionEnded();
     throw error;
   }
   return data;
@@ -192,45 +204,89 @@ async function api(method, path, body) {
 /* ---------- Sign-in, lock and idle ---------- */
 
 let idleTimer = null;
-let lastInput = Date.now();
+let pingTimer = null;
+let lastPingAt = 0;
+let inputSincePing = false;
+let lastMousemove = 0;
 
+/** Real user input: it keeps the session alive. Requests the page makes alone do not. The first input after a quiet minute pings at once. */
 function noteInput() {
-  lastInput = Date.now();
+  if (session.csrf && Date.now() - lastPingAt >= PING_MS) ping();
+  else inputSincePing = true;
 }
 
-function scheduleIdleLock() {
+function noteMousemove() {
+  if (Date.now() - lastMousemove < MOUSEMOVE_MS) return;
+  lastMousemove = Date.now();
+  noteInput();
+}
+
+/** Whether the user watches a running run on a visible page. */
+function isWatchingRun() {
+  return document.visibilityState === 'visible' && Boolean(shell.view && shell.view.isWatching && shell.view.isWatching());
+}
+
+async function ping() {
+  inputSincePing = false;
+  lastPingAt = Date.now();
+  try { await api('POST', '/session/ping'); } catch { /* A 401 already shows the lock screen. */ }
+}
+
+/** Every minute: tells the service about input since the last ping, or that the user watches a run. */
+function schedulePing() {
+  clearTimeout(pingTimer);
+  if (!session.csrf) return;
+  pingTimer = setTimeout(async () => {
+    if (inputSincePing || isWatchingRun()) await ping();
+    schedulePing();
+  }, PING_MS);
+}
+
+/** The service decides when the one session of all tabs is idle; this tab asks when it may be, without counting as use. */
+function scheduleIdleCheck(delay) {
   clearTimeout(idleTimer);
   if (!session.csrf) return;
-  idleTimer = setTimeout(() => {
-    if (Date.now() - lastInput >= IDLE_MS) lock();
-    else scheduleIdleLock();
-  }, Math.max(1000, IDLE_MS - (Date.now() - lastInput)));
+  idleTimer = setTimeout(checkIdle, Math.max(1000, delay));
 }
 
-function sessionEnded(code) {
+async function checkIdle() {
+  if (inputSincePing) await ping();
+  if (!session.csrf) return;
+  try {
+    const me = await api('GET', '/session', undefined, { background: true });
+    scheduleIdleCheck(me.idle_left_ms + 1000);
+  } catch (failure) {
+    if (failure.status === 401) sessionEnded();
+    else scheduleIdleCheck(PING_MS);
+  }
+}
+
+/** With a remembered email the screen asks only for the password, also after a reload or a restart of the app. */
+function sessionEnded() {
   const email = session.email || storedEmail();
   endSession();
-  if (code === 'locked' && email) showLock(email);
+  if (email) showLock(email);
   else showSignIn();
 }
 
 function endSession() {
   session.csrf = null;
   clearTimeout(idleTimer);
+  clearTimeout(pingTimer);
   closeDialogs();
   shell.stop();
 }
 
 async function lock() {
   const email = session.email;
-  try { await api('DELETE', '/session'); } catch { /* The screen locks anyway. */ }
+  try { await api('POST', '/session/lock'); } catch { /* The screen locks anyway. */ }
   endSession();
   showLock(email);
 }
 
 async function signOut() {
   try { await api('DELETE', '/session'); } catch { /* Signed out locally anyway. */ }
-  storeEmail(null);
+  forgetEmail();
   session.email = null;
   endSession();
   showSignIn();
@@ -288,10 +344,10 @@ function showSignIn() {
 function showLock(email) {
   showAuth(authForm({
     heading: 'Locked',
-    hint: 'Upkeep is locked. It also locks after 15 minutes without use. Enter your password to go on.',
+    hint: 'Upkeep is locked. It also locks when nobody uses it for a time. Enter your password to go on.',
     email,
     submitLabel: 'Unlock',
-    extra: h('p', { class: 'hint auth-foot' }, h('button', { type: 'button', class: 'link-plain', onclick: () => { storeEmail(null); showSignIn(); } }, 'Sign in as someone else')),
+    extra: h('p', { class: 'hint auth-foot' }, h('button', { type: 'button', class: 'link-plain', onclick: () => { forgetEmail(); showSignIn(); } }, 'Sign in as someone else')),
   }));
 }
 
@@ -303,9 +359,11 @@ function initials(email) {
 function startSession(me) {
   session.email = me.email;
   session.csrf = me.csrf;
-  storeEmail(me.email);
-  lastInput = Date.now();
-  scheduleIdleLock();
+  session.idleMs = me.idle_ms;
+  lastPingAt = Date.now();
+  inputSincePing = false;
+  scheduleIdleCheck(me.idle_ms);
+  schedulePing();
   document.getElementById('boot').hidden = true;
   document.getElementById('auth').hidden = true;
   document.getElementById('app').hidden = false;
@@ -700,9 +758,9 @@ function overviewView() {
   const content = h('div', { class: 'content' }, loadingPanel('Loading the overview…'));
   const el = [topBar(null, 'Overview', button('Add server', { kind: 'pri', icon: 'plus', onClick: () => serverDialog() })), content];
 
-  async function render() {
+  async function render({ background = false } = {}) {
     try {
-      const [figures, recent] = await Promise.all([api('GET', '/overview'), api('GET', '/runs')]);
+      const [figures, recent] = await Promise.all([api('GET', '/overview', undefined, { background }), api('GET', '/runs', undefined, { background })]);
       const servers = shell.servers;
       if (!servers.length) {
         content.replaceChildren(h('div', { class: 'panel' }, h('div', { class: 'empty' },
@@ -738,7 +796,8 @@ function overviewView() {
     }
   }
   render();
-  return { el, onRunChange: render, onServersChange: render };
+  const refresh = () => render({ background: true });
+  return { el, onRunChange: refresh, onServersChange: refresh };
 }
 
 function serverView(id) {
@@ -756,9 +815,9 @@ function serverView(id) {
   const el = [topBar('Servers', server.name, actions), h('div', { class: 'content' }, stats, banner,
     h('div', { class: 'panel' }, h('div', { class: 'ph' }, h('h3', {}, 'Operations'), h('span', { class: 'ph-note' }, 'Scripts in /.upkeep on this server')), list))];
 
-  async function loadStats() {
+  async function loadStats({ background = false } = {}) {
     try {
-      const page = await api('GET', `/servers/${id}`);
+      const page = await api('GET', `/servers/${id}`, undefined, { background });
       const last = page.last_run;
       const lastText = last ? `${last.title} ${last.status === 'succeeded' ? '✓' : last.status === 'running' ? '…' : '✗'}` : 'None';
       const address = page.server.port === 22 ? page.server.address : `${page.server.address}:${page.server.port}`;
@@ -768,13 +827,13 @@ function serverView(id) {
     }
   }
 
-  async function loadOperations() {
+  async function loadOperations({ background = false } = {}) {
     try {
-      const answer = await api('GET', `/servers/${id}/operations`);
+      const answer = await api('GET', `/servers/${id}/operations`, undefined, { background });
       badge.className = answer.connected ? 'badge b-ok' : 'badge b-bad';
       badge.textContent = answer.connected ? '● Connected over SSH' : '● Cannot connect';
       banner.replaceChildren(answer.connected ? '' : errorPanel(`Cannot reach the server: ${answer.error}. The list shows the operations Upkeep saw last.`, loadOperations));
-      shell.refreshServers();
+      shell.refreshServers({ background });
       drawOperations(answer.operations);
     } catch (failure) {
       badge.className = 'badge b-bad';
@@ -782,7 +841,7 @@ function serverView(id) {
       banner.replaceChildren(errorPanel(failure.message, loadOperations));
       list.replaceChildren();
     }
-    loadStats(); // After the list, so the count matches what the server has.
+    loadStats({ background }); // After the list, so the count matches what the server has.
   }
 
   function drawOperations(operations) {
@@ -812,7 +871,7 @@ function serverView(id) {
   loadOperations();
   return {
     el,
-    onRunChange(run) { if (run.server_id === id) loadOperations(); },
+    onRunChange(run) { if (run.server_id === id) loadOperations({ background: true }); },
   };
 }
 
@@ -1056,6 +1115,7 @@ function runView(id) {
   load();
   return {
     el,
+    isWatching: () => Boolean(run && run.status === 'running'),
     destroy() {
       closed = true;
       if (source) source.close();
@@ -1185,12 +1245,12 @@ const shell = {
       if (this.view && this.view.onRunChange) this.view.onRunChange(run);
     });
     // On reconnect the page reads the current state once.
-    this.events.addEventListener('open', () => { if (this.view) this.refreshServers(); });
+    this.events.addEventListener('open', () => { if (this.view) this.refreshServers({ background: true }); });
   },
 
-  async refreshServers() {
+  async refreshServers({ background = false } = {}) {
     try {
-      const answer = await api('GET', '/servers');
+      const answer = await api('GET', '/servers', undefined, { background });
       this.servers = answer.servers;
     } catch (failure) {
       if (failure.status !== 401) toast(failure.message, true);
@@ -1251,11 +1311,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   document.getElementById('lock').addEventListener('click', lock);
   document.getElementById('sign-out').addEventListener('click', signOut);
   for (const type of ['mousedown', 'keydown', 'wheel', 'touchstart']) document.addEventListener(type, noteInput, { passive: true, capture: true });
+  document.addEventListener('mousemove', noteMousemove, { passive: true, capture: true });
+  window.addEventListener('focus', noteInput);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') noteInput(); });
   try {
     startSession(await api('GET', '/session'));
   } catch (failure) {
     const email = storedEmail();
-    if (failure.code === 'locked' && email) showLock(email);
+    if (failure.status === 401 && email) showLock(email);
     else if (failure.status === 0) showAuth(h('div', { class: 'auth-card' }, h('h1', {}, 'Upkeep is not reachable'), h('p', { class: 'hint' }, failure.message)));
     else showSignIn();
   }

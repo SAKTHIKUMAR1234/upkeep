@@ -2,10 +2,11 @@ pub mod auth;
 pub mod operations;
 pub mod routes;
 pub mod runs;
+pub mod serve;
 pub mod servers;
 pub mod store;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 
 use runs::Executor;
+use serve::ServeConfig;
 use store::Db;
 
 /// Where the desktop app keeps its state, and how it reaches servers.
@@ -81,7 +83,7 @@ pub fn default_data_dir() -> PathBuf {
     PathBuf::from(home).join(".local/share/upkeep-app")
 }
 
-/// The REST service, bound to a loopback port and ready to serve.
+/// The REST service, bound and ready to serve.
 pub struct Service {
     listener: TcpListener,
     executor: Arc<Executor>,
@@ -90,8 +92,8 @@ pub struct Service {
 
 impl Service {
     /// Opens the data folder, marks runs that a previous process left as interrupted, and binds
-    /// 127.0.0.1:`port` (0 picks a free port).
-    pub async fn bind(config: AppConfig, port: u16) -> anyhow::Result<Self> {
+    /// `serve.listen` (port 0 picks a free port).
+    pub async fn bind(config: AppConfig, serve: ServeConfig) -> anyhow::Result<Self> {
         let db = Arc::new(config.open_db()?);
         let interrupted = db.interrupt_running_runs()?;
         if interrupted > 0 {
@@ -100,12 +102,12 @@ impl Service {
                 "runs left running by the last process are interrupted"
             );
         }
-        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+        let listener = TcpListener::bind(serve.listen)
             .await
-            .with_context(|| format!("cannot listen on 127.0.0.1:{port}"))?;
+            .with_context(|| format!("cannot listen on {}", serve.listen))?;
         let port = listener.local_addr()?.port();
         let executor = Arc::new(Executor::new(db.clone(), Arc::new(config)));
-        let router = routes::router(routes::AppState::new(db, executor.clone(), port));
+        let router = routes::router(routes::AppState::new(db, executor.clone(), port, serve));
         Ok(Self {
             listener,
             executor,
@@ -120,7 +122,7 @@ impl Service {
     }
 
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/", self.address().port())
+        format!("http://{}/", self.address())
     }
 
     pub fn executor(&self) -> Arc<Executor> {
@@ -130,7 +132,10 @@ impl Service {
     /// Serves until `shutdown` completes. Open event streams end with it.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> anyhow::Result<()> {
         tokio::select! {
-            result = axum::serve(self.listener, self.router) => result?,
+            result = axum::serve(
+                self.listener,
+                self.router.into_make_service_with_connect_info::<SocketAddr>(),
+            ) => result?,
             () = shutdown => {}
         }
         Ok(())

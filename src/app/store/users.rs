@@ -78,6 +78,7 @@ impl Db {
     }
 
     /// Consecutive failed sign-ins for an email, and until when it must wait.
+    #[cfg(test)]
     pub fn login_failures(&self, email: &str) -> rusqlite::Result<(u32, i64)> {
         Ok(self
             .lock()
@@ -90,18 +91,34 @@ impl Db {
             .unwrap_or((0, 0)))
     }
 
-    pub fn set_login_failures(
+    /// Reads the failures in a row and the lock end of an email, and stores the pair that
+    /// `change` returns, in one step. An `Err` from `change` stores nothing.
+    pub fn change_login_failures<E>(
         &self,
         email: &str,
-        failures: u32,
-        locked_until: i64,
-    ) -> rusqlite::Result<()> {
-        self.lock().execute(
-            "INSERT INTO login_failures (email, failures, locked_until) VALUES (?1, ?2, ?3) \
-             ON CONFLICT (email) DO UPDATE SET failures = ?2, locked_until = ?3",
-            params![normalize_email(email), failures, locked_until],
-        )?;
-        Ok(())
+        change: impl FnOnce(u32, i64) -> Result<(u32, i64), E>,
+    ) -> rusqlite::Result<Result<(u32, i64), E>> {
+        let email = normalize_email(email);
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        let (failures, locked_until) = transaction
+            .query_row(
+                "SELECT failures, locked_until FROM login_failures WHERE email = ?1",
+                [&email],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0));
+        let changed = change(failures, locked_until);
+        if let Ok((failures, locked_until)) = changed {
+            transaction.execute(
+                "INSERT INTO login_failures (email, failures, locked_until) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (email) DO UPDATE SET failures = ?2, locked_until = ?3",
+                params![email, failures, locked_until],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn clear_login_failures(&self, email: &str) -> rusqlite::Result<()> {
@@ -151,7 +168,14 @@ mod tests {
     fn login_failures_are_stored_per_email() {
         let (_dir, db) = database();
         assert_eq!(db.login_failures("x@example.com").unwrap(), (0, 0));
-        db.set_login_failures("X@example.com", 5, 99).unwrap();
+        let stored = db
+            .change_login_failures("X@example.com", |_, _| Ok::<_, ()>((5, 99)))
+            .unwrap();
+        assert_eq!(stored, Ok((5, 99)));
+        let refused = db
+            .change_login_failures("x@example.com", |failures, _| Err(failures))
+            .unwrap();
+        assert_eq!(refused, Err(5));
         assert_eq!(db.login_failures("x@example.com").unwrap(), (5, 99));
         db.clear_login_failures("x@example.com").unwrap();
         assert_eq!(db.login_failures("x@example.com").unwrap(), (0, 0));

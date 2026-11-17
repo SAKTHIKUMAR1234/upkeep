@@ -12,19 +12,18 @@ pub fn wait_after(failures: u32) -> Option<i64> {
     Some((FIRST_WAIT_MS << doublings).min(MAX_WAIT_MS))
 }
 
-/// Milliseconds the email must still wait before the next attempt, if any.
-pub fn remaining_wait(db: &Db, email: &str, now: i64) -> rusqlite::Result<Option<i64>> {
-    let (_, locked_until) = db.login_failures(email)?;
-    Ok((locked_until > now).then(|| locked_until - now))
-}
-
-/// Counts a failure and returns the number of failures in a row.
-pub fn record_failure(db: &Db, email: &str, now: i64) -> rusqlite::Result<u32> {
-    let (failures, _) = db.login_failures(email)?;
-    let failures = failures + 1;
-    let locked_until = wait_after(failures).map_or(0, |wait| now + wait);
-    db.set_login_failures(email, failures, locked_until)?;
-    Ok(failures)
+/// Counts a sign-in attempt for the email before the password check, in one step with the
+/// check of its wait. Returns the attempts in a row, or the milliseconds the email must still
+/// wait. A right password clears the count.
+pub fn begin_attempt(db: &Db, email: &str, now: i64) -> rusqlite::Result<Result<u32, i64>> {
+    let counted = db.change_login_failures(email, |failures, locked_until| {
+        if locked_until > now {
+            return Err(locked_until - now);
+        }
+        let failures = failures + 1;
+        Ok((failures, wait_after(failures).map_or(0, |wait| now + wait)))
+    })?;
+    Ok(counted.map(|(failures, _)| failures))
 }
 
 #[cfg(test)]
@@ -45,25 +44,35 @@ mod tests {
     }
 
     #[test]
-    fn failures_lock_the_email_until_the_wait_ends() {
+    fn attempts_lock_the_email_until_the_wait_ends() {
         let (_dir, db) = database();
         for attempt in 1..=4 {
-            assert_eq!(record_failure(&db, "a@x.com", 1_000).unwrap(), attempt);
-            assert_eq!(remaining_wait(&db, "a@x.com", 1_000).unwrap(), None);
+            assert_eq!(begin_attempt(&db, "a@x.com", 1_000).unwrap(), Ok(attempt));
         }
-        assert_eq!(record_failure(&db, "A@x.com", 1_000).unwrap(), 5);
-        assert_eq!(
-            remaining_wait(&db, "a@x.com", 11_000).unwrap(),
-            Some(20_000)
-        );
-        assert_eq!(remaining_wait(&db, "a@x.com", 31_000).unwrap(), None);
-        assert_eq!(record_failure(&db, "a@x.com", 31_000).unwrap(), 6);
-        assert_eq!(
-            remaining_wait(&db, "a@x.com", 31_000).unwrap(),
-            Some(60_000)
-        );
+        assert_eq!(begin_attempt(&db, "A@x.com", 1_000).unwrap(), Ok(5));
+        assert_eq!(begin_attempt(&db, "a@x.com", 11_000).unwrap(), Err(20_000));
+        assert_eq!(begin_attempt(&db, "a@x.com", 31_000).unwrap(), Ok(6));
+        assert_eq!(begin_attempt(&db, "a@x.com", 31_000).unwrap(), Err(60_000));
 
         db.clear_login_failures("a@x.com").unwrap();
-        assert_eq!(record_failure(&db, "a@x.com", 100_000).unwrap(), 1);
+        assert_eq!(begin_attempt(&db, "a@x.com", 100_000).unwrap(), Ok(1));
+    }
+
+    #[test]
+    fn parallel_attempts_on_one_email_stop_at_the_fifth() {
+        let (_dir, db) = database();
+        let db = std::sync::Arc::new(db);
+        let threads: Vec<_> = (0..30)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || begin_attempt(&db, "victim@x.com", 1_000).unwrap())
+            })
+            .collect();
+        let allowed = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(allowed, FREE_ATTEMPTS as usize);
     }
 }

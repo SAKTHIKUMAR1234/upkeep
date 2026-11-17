@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::path::Path as FilePath;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -9,10 +10,15 @@ use futures_util::stream::{self, Stream, StreamExt};
 use serde::Deserialize;
 use tokio::sync::broadcast::{Receiver, error::RecvError};
 
-use super::{AppError, AppState, Auth};
+use super::{AppError, AppState, StreamAuth};
+use crate::app::auth::session::{SessionState, state as session_state};
 use crate::app::runs::output::{MAX_CHUNK, read_chunk};
 use crate::app::runs::{RunEvent, Subscription};
 use crate::app::store::{RunRecord, RunStatus};
+use crate::time::now_millis;
+
+/// How often an open stream checks that its session still lives.
+const SESSION_CHECK: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 pub struct EventsQuery {
@@ -55,10 +61,25 @@ fn catch_up(path: &FilePath, from: u64) -> (Vec<Event>, u64) {
     (events, offset)
 }
 
+/// Completes when the session of `token` ends, so that its streams close with it.
+async fn session_end(state: AppState, token: String) {
+    loop {
+        tokio::time::sleep(SESSION_CHECK).await;
+        let live = state.db.session(&token).is_ok_and(|session| {
+            session.is_some_and(|session| {
+                session_state(&session, now_millis(), state.serve.sessions) == SessionState::Live
+            })
+        });
+        if !live {
+            return;
+        }
+    }
+}
+
 /// A run's state, then its output from `from` (or `Last-Event-ID`) with the live rows, then live
 /// changes until the run ends.
 pub async fn run_events(
-    _auth: Auth,
+    StreamAuth(auth): StreamAuth,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     Query(query): Query<EventsQuery>,
@@ -90,7 +111,10 @@ pub async fn run_events(
         None => stream::empty().boxed(),
     };
     let initial = stream::iter(events.into_iter().map(Ok));
-    Ok(Sse::new(initial.chain(live).boxed()).keep_alive(KeepAlive::default()))
+    let events = initial
+        .chain(live)
+        .take_until(session_end(state, auth.token));
+    Ok(Sse::new(events.boxed()).keep_alive(KeepAlive::default()))
 }
 
 /// Events of an active run after byte `written`, which the catch-up already sent.
@@ -115,7 +139,10 @@ fn live_events(
 }
 
 /// Runs that start or end on any server, for the sidebar and the lists.
-pub async fn changes(_auth: Auth, State(state): State<AppState>) -> impl IntoResponse {
+pub async fn changes(
+    StreamAuth(auth): StreamAuth,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     let receiver = state.executor.changes();
     let events = stream::unfold(receiver, |mut receiver| async move {
         loop {
@@ -126,5 +153,6 @@ pub async fn changes(_auth: Auth, State(state): State<AppState>) -> impl IntoRes
             }
         }
     });
+    let events = events.take_until(session_end(state, auth.token));
     Sse::new(events.boxed()).keep_alive(KeepAlive::default())
 }

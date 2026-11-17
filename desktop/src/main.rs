@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tauri::{WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tracing_subscriber::EnvFilter;
+use upkeep::app::serve::ServeConfig;
 use upkeep::app::{AppConfig, Service, default_data_dir};
 
 /// A second close within this time quits while runs are active.
@@ -19,7 +20,10 @@ fn main() -> anyhow::Result<()> {
         .init();
     let data_dir = std::env::var_os("UPKEEP_APP_DIR").map_or_else(default_data_dir, Into::into);
     let runtime = tokio::runtime::Runtime::new()?;
-    let service = runtime.block_on(Service::bind(AppConfig::new(data_dir), 0))?;
+    let service = runtime.block_on(Service::bind(
+        AppConfig::new(data_dir),
+        ServeConfig::loopback(0),
+    ))?;
     let url = service.url().parse()?;
     let executor = service.executor();
     runtime.spawn(async move {

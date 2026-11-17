@@ -157,6 +157,20 @@ pub fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
+/// The longest email the app accepts, in bytes.
+pub const MAX_EMAIL_BYTES: usize = 254;
+
+/// An email of at most [`MAX_EMAIL_BYTES`] with one `@`, a dot in the domain and no spaces.
+pub fn is_valid_email(email: &str) -> bool {
+    email.len() <= MAX_EMAIL_BYTES
+        && !email
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+        && email.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty() && domain.contains('.') && !domain.contains('@')
+        })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

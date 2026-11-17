@@ -7,13 +7,15 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 
 use crate::app::auth::password;
+use crate::app::serve::ServeConfig;
 use crate::app::store::{Db, NewRun, RunStatus};
 use crate::app::{AppConfig, Service};
 
-const PASSWORD: &str = "correct horse battery";
+pub(super) const PASSWORD: &str = "correct horse battery";
 
 /// Stands in for `ssh`: runs the remote command on this machine with `/.upkeep` and `/run/lock`
-/// moved to test folders, and fails like `ssh` while `<root>.down` exists. Every server of a test
+/// moved to test folders, fails like `ssh` while `<root>.down` exists, and takes a second per
+/// call while `<root>.slow` exists. Every server of a test
 /// is the same machine, so they share one lock.
 const FAKE_SSH: &str = r#"#!/bin/bash
 root="__ROOT__"
@@ -26,6 +28,7 @@ while [ $# -gt 0 ]; do
 done
 shift
 if [ -e "$root.down" ]; then echo "ssh: connect to host: Connection refused" >&2; exit 255; fi
+if [ -e "$root.slow" ]; then sleep 1; fi
 sudo() {
   [ "$1" = -n ] && shift
   case "$1" in
@@ -42,17 +45,19 @@ bash -c "${command//\/run\/lock/$root.lock}" | sed -u "s#$root.lock#/run/lock#g;
 exit "${PIPESTATUS[0]}"
 "#;
 
-struct World {
-    base: String,
-    http: reqwest::Client,
-    db: Arc<Db>,
+pub(super) struct World {
+    pub(super) base: String,
+    pub(super) http: reqwest::Client,
+    pub(super) db: Arc<Db>,
+    /// The `Host` header of a website.
+    host: Option<String>,
     dir: tempfile::TempDir,
 }
 
 /// A signed-in browser: its cookie and CSRF token.
-struct Session {
-    cookie: String,
-    csrf: String,
+pub(super) struct Session {
+    pub(super) cookie: String,
+    pub(super) csrf: String,
 }
 
 fn executable(path: &Path, text: &str) {
@@ -62,6 +67,10 @@ fn executable(path: &Path, text: &str) {
 
 impl World {
     async fn new() -> Self {
+        Self::with(ServeConfig::loopback(0)).await
+    }
+
+    pub(super) async fn with(serve: ServeConfig) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("remote-upkeep");
         let ssh = dir.path().join("ssh");
@@ -84,13 +93,18 @@ impl World {
         let hash = password::hash(PASSWORD).unwrap();
         db.add_user("owner@example.com", &hash, 1).unwrap();
 
-        let service = Service::bind(config, 0).await.unwrap();
+        let service = Service::bind(config, serve.clone()).await.unwrap();
+        let host = serve
+            .public_origin
+            .as_ref()
+            .map(|origin| origin.trim_start_matches("https://").to_owned());
         let base = format!("http://127.0.0.1:{}", service.address().port());
         tokio::spawn(service.run(std::future::pending()));
         Self {
             base,
             http: reqwest::Client::new(),
             db,
+            host,
             dir,
         }
     }
@@ -103,7 +117,7 @@ impl World {
         self.dir.path().join("id_test").display().to_string()
     }
 
-    async fn request(
+    pub(super) async fn request(
         &self,
         method: Method,
         path: &str,
@@ -111,6 +125,9 @@ impl World {
         session: Option<&Session>,
     ) -> reqwest::Response {
         let mut request = self.http.request(method, format!("{}{path}", self.base));
+        if let Some(host) = &self.host {
+            request = request.header("host", host);
+        }
         if let Some(session) = session {
             request = request
                 .header("cookie", &session.cookie)
@@ -122,7 +139,7 @@ impl World {
         request.send().await.unwrap()
     }
 
-    async fn call(
+    pub(super) async fn call(
         &self,
         method: Method,
         path: &str,
@@ -135,13 +152,13 @@ impl World {
         (status, serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 
-    async fn sign_in_as(&self, email: &str, password: &str) -> reqwest::Response {
+    pub(super) async fn sign_in_as(&self, email: &str, password: &str) -> reqwest::Response {
         let body = json!({"email": email, "password": password});
         self.request(Method::POST, "/api/session", Some(body), None)
             .await
     }
 
-    async fn sign_in(&self) -> Session {
+    pub(super) async fn sign_in(&self) -> Session {
         let response = self.sign_in_as("Owner@Example.com", PASSWORD).await;
         assert_eq!(response.status(), StatusCode::OK);
         let cookie = response.headers()["set-cookie"]
@@ -212,7 +229,7 @@ impl World {
         chunk["text"].as_str().unwrap().to_owned()
     }
 
-    async fn activity(&self, session: &Session) -> Vec<Value> {
+    pub(super) async fn activity(&self, session: &Session) -> Vec<Value> {
         let (_, page) = self.call(Method::GET, "/api/activity", None, session).await;
         page["items"].as_array().unwrap().clone()
     }
@@ -238,6 +255,8 @@ async fn every_api_route_refuses_a_signed_out_request() {
     let routes = [
         (Method::GET, "/api/session"),
         (Method::DELETE, "/api/session"),
+        (Method::POST, "/api/session/ping"),
+        (Method::POST, "/api/session/lock"),
         (Method::GET, "/api/overview"),
         (Method::GET, "/api/ssh-keys"),
         (Method::GET, "/api/servers"),
@@ -379,13 +398,32 @@ async fn five_failures_lock_the_email_and_success_resets_the_count() {
 
     world
         .db
-        .set_login_failures("owner@example.com", 4, 0)
+        .change_login_failures("owner@example.com", |_, _| Ok::<_, ()>((4, 0)))
+        .unwrap()
         .unwrap();
     world.sign_in().await;
     assert_eq!(
         world.db.login_failures("owner@example.com").unwrap(),
         (0, 0)
     );
+}
+
+#[tokio::test]
+async fn parallel_wrong_passwords_lock_the_email_after_five() {
+    let world = World::new().await;
+    let answers = futures_util::future::join_all(
+        (0..30).map(|_| world.sign_in_as("victim@example.com", "wrong password!")),
+    )
+    .await;
+    let checked = answers
+        .iter()
+        .filter(|answer| answer.status() == StatusCode::UNAUTHORIZED)
+        .count();
+    assert_eq!(checked, 5, "only five passwords were checked");
+    assert!(answers.iter().all(|answer| matches!(
+        answer.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS
+    )));
 }
 
 #[tokio::test]
@@ -431,13 +469,26 @@ async fn an_idle_session_asks_for_the_password_again() {
         (status, &body["code"]),
         (StatusCode::UNAUTHORIZED, &json!("locked"))
     );
-    let (status, _) = world
+    let parallel = futures_util::future::join_all(
+        ["/api/overview", "/api/runs", "/api/session", "/api/events"]
+            .map(|path| world.call(Method::GET, path, None, &session)),
+    )
+    .await;
+    for (status, body) in parallel {
+        assert_eq!(
+            (status, &body["code"]),
+            (StatusCode::UNAUTHORIZED, &json!("locked")),
+            "every request of an idle session answers the same"
+        );
+    }
+
+    world.sign_in().await;
+    let (_, body) = world
         .call(Method::GET, "/api/servers", None, &session)
         .await;
     assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "locking deleted the session"
+        body["code"], "signed_out",
+        "a sign-in removes idle sessions"
     );
 }
 
@@ -745,6 +796,41 @@ async fn operations_are_created_read_edited_and_deleted_on_the_server() {
         world.call(Method::DELETE, &path, None, &session).await.0,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn an_operation_change_finishes_after_the_client_leaves() {
+    let world = World::new().await;
+    let session = world.sign_in().await;
+    let server = world.add_server(&session).await;
+    std::fs::write(format!("{}.slow", world.root().display()), "").unwrap();
+    let body = json!({"title": "Slow", "folder": "slow", "run_sh": "#!/bin/bash\ntrue\n", "check_sh": "#!/bin/bash\ntrue\n"});
+    let left = world
+        .http
+        .post(format!("{}/api/servers/{server}/operations", world.base))
+        .header("cookie", &session.cookie)
+        .header("x-csrf-token", &session.csrf)
+        .json(&body)
+        .timeout(Duration::from_millis(500))
+        .send()
+        .await;
+    assert!(left.is_err(), "the client left before the answer");
+
+    let mut recorded = false;
+    for _ in 0..100 {
+        let actions = world.activity(&session).await;
+        if actions
+            .iter()
+            .any(|entry| entry["action"] == "operation_create")
+        {
+            recorded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(recorded, "the change was written to the activity log");
+    let saved = world.db.cached_operations(server).unwrap();
+    assert!(saved.iter().any(|operation| operation.folder == "slow"));
 }
 
 #[tokio::test]
@@ -1175,6 +1261,8 @@ async fn runs_left_running_are_interrupted_when_the_service_starts() {
         now: 1,
     };
     let id = db.start_run(&run).unwrap().unwrap();
-    let _service = Service::bind(config, 0).await.unwrap();
+    let _service = Service::bind(config, ServeConfig::loopback(0))
+        .await
+        .unwrap();
     assert_eq!(db.run(id).unwrap().unwrap().status, RunStatus::Interrupted);
 }
